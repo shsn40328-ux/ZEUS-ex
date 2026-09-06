@@ -17,9 +17,13 @@ _DEFAULT_PROFILE = {
     "settings": {
         "output_format": "txt",
         "bubble_spacing": True,
-        "include_sfx": True,
+        # تعطيل المؤثرات الصوتية هو الافتراضي المفعّل (تجاهل تام للـ SFX)
+        "include_sfx": False,
+        # الفاصل ثابت على اسم الصورة الأصلية
         "separator_mode": "original_name",
-        "separator_template": "## {name}",
+        # الترجمة الأدبية — ميزة جديدة معطلة افتراضيًا
+        "translate_enabled": False,
+        "translate_target": "ar",
     },
 }
 _DEFAULT_GUILD_PROFILE = {

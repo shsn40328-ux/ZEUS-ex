@@ -1,6 +1,7 @@
 import json
 import re
 import base64
+import time
 from pathlib import Path
 from typing import Any
 
@@ -165,8 +166,24 @@ class EmojiManager:
             if item is None:
                 mime = "image/gif" if path.suffix.lower() == ".gif" else "image/png"
                 payload = {"name": discord_name, "image": f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"}
-                created = requests.post(api, headers=headers, json=payload, timeout=30)
-                created.raise_for_status()
+                created = None
+                last_error = None
+                for attempt in range(3):
+                    try:
+                        created = requests.post(api, headers=headers, json=payload, timeout=30)
+                        if created.status_code == 429:
+                            retry_after = float(created.json().get("retry_after", 2.0) or 2.0)
+                            time.sleep(min(retry_after, 10.0))
+                            created = None
+                            continue
+                        created.raise_for_status()
+                        break
+                    except requests.RequestException as exc:
+                        last_error = exc
+                        created = None
+                        time.sleep(1.5 * (attempt + 1))
+                if created is None:
+                    raise last_error or RuntimeError(f"failed to upload emoji {discord_name}")
                 item = created.json()
                 existing[discord_name] = item
                 uploaded += 1

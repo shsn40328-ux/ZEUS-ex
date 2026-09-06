@@ -119,7 +119,8 @@ discord.Message.edit = _patched_message_edit
 # عرض موحد للرسائل — Emojis + Markdown منسق
 # ============================================================
 RULE = "\n\n---\n\n"
-V2_SEPARATOR_SUPPORTED = all(hasattr(discord.ui, name) for name in ("LayoutView", "Container", "TextDisplay", "Separator"))
+V2_SUPPORTED = all(hasattr(discord.ui, name) for name in ("LayoutView", "Container", "TextDisplay", "Separator", "File", "ActionRow"))
+V2_SEPARATOR_SUPPORTED = V2_SUPPORTED
 SUPPORT_SERVER_URL = os.getenv("SUPPORT_SERVER_URL", "").strip()
 
 def line():
@@ -132,25 +133,11 @@ def fmt_bool(value):
 def status_embed(title, description, *, error=False):
     return themed_embed(title=title, description=description, color_name="red" if error else "gold")
 
-SEPARATOR_MODES = {
-    "original_name": "اسم الصورة الأصلية",
-    "simple_index": "ترقيم بسيط",
-    "custom": "قالب مخصص",
-}
-DEFAULT_SEPARATOR_TEMPLATE = "## {name}"
-
 
 def output_separator(settings, idx, image_name):
-    mode = settings.get("separator_mode", "original_name")
+    """فاصل الصفحات داخل الملف — ثابت دائمًا على اسم الصورة الأصلية."""
     safe_name = Path(image_name or f"صورة {idx}").name
-    if mode == "simple_index":
-        heading = f"## صورة {idx}"
-    elif mode == "custom":
-        template = (settings.get("separator_template") or DEFAULT_SEPARATOR_TEMPLATE).strip() or DEFAULT_SEPARATOR_TEMPLATE
-        heading = template.replace("{index}", str(idx)).replace("{name}", safe_name)
-    else:
-        heading = f"## {safe_name}"
-    return f"\n\n{line()}\n{heading}\n{line()}\n\n"
+    return f"\n\n{line()}\n## {safe_name}\n{line()}\n\n"
 
 
 def format_duration(seconds):
@@ -192,6 +179,163 @@ async def send_panel(destination, title=None, description=None, *, sections=None
     embed = themed_embed(title=title, description=description or ("\n\n".join(sections or [])), color_name="red" if error else "gold")
     kwargs.update({"embed": embed, "view": view})
     return await destination.send(**kwargs)
+
+
+# ============================================================
+# لوحة النتيجة النهائية — Components V2 مع الملف داخل الرسالة
+# ============================================================
+def result_panel_view(*, user_id, total_images, empty_images, duration_text, format_label,
+                      points_label, points_after, main_name, translation=None, warning=None):
+    """
+    تبني لوحة نتيجة الاستخراج النهائية بنظام Components V2:
+    - عبارة (تم استخراج الفصل) مرة واحدة فقط
+    - المنشن داخل الرسالة نفسها
+    - تقرير الجودة على ثلاثة أسطر
+    - الملفات مرفوعة داخل الرسالة عبر مكوّن File
+    - فواصل مرئية وتنسيق ماركداون ديسكورد فاخر
+    """
+    if not V2_SUPPORTED:
+        return None
+    container = discord.ui.Container(accent_colour=discord.Colour(THEMES["gold"]["color"]))
+
+    # العنوان — مرة واحدة فقط
+    container.add_item(discord.ui.TextDisplay(emojize("## {emoji:circlecheck} تم استخراج الفصل")))
+    container.add_item(discord.ui.Separator(visible=True))
+
+    # المنشن داخل الرسالة
+    container.add_item(discord.ui.TextDisplay(emojize(
+        f"**{emoji_manager.placeholder('user')} المستخدم:** <@{user_id}>"
+    )))
+    container.add_item(discord.ui.Separator(visible=True))
+
+    # تقرير الجودة على ثلاثة أسطر
+    container.add_item(discord.ui.TextDisplay(emojize(
+        f"### {emoji_manager.placeholder('chartpie')} تقرير الجودة\n"
+        f"> {emoji_manager.placeholder('photo')} **الصور الفارغة:** `{empty_images}` من إجمالي `{total_images}` صورة\n"
+        f"> {emoji_manager.placeholder('clock')} **مدة المعالجة:** `{duration_text}`\n"
+        f"> {emoji_manager.placeholder('list')} **صيغة الناتج:** `{format_label}`"
+    )))
+    container.add_item(discord.ui.Separator(visible=True))
+
+    # الرصيد
+    container.add_item(discord.ui.TextDisplay(emojize(
+        f"### {emoji_manager.placeholder('star')} النقاط\n"
+        f"> تم خصم `1` نقطة من **{points_label}** — المتبقي: `{points_after}`"
+    )))
+
+    # تحذير الترجمة إن وجد
+    if warning:
+        container.add_item(discord.ui.Separator(visible=True))
+        container.add_item(discord.ui.TextDisplay(emojize(
+            f"### {emoji_manager.placeholder('alerttriangle')} تنبيه\n> {warning}"
+        )))
+
+    container.add_item(discord.ui.Separator(visible=True))
+
+    # الملفات داخل الرسالة
+    container.add_item(discord.ui.TextDisplay(emojize(
+        f"### {emoji_manager.placeholder('folderopen')} الملفات\n"
+        f"> {emoji_manager.placeholder('list')} **النص المستخرج:** `{main_name}`"
+    )))
+    container.add_item(discord.ui.File(f"attachment://{main_name}"))
+    if translation:
+        container.add_item(discord.ui.TextDisplay(emojize(
+            f"> {emoji_manager.placeholder('message')} **الترجمة الأدبية ({translation['target_label']}):** `{translation['filename']}`"
+        )))
+        container.add_item(discord.ui.File(f"attachment://{translation['filename']}"))
+
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    return view
+
+
+async def deliver_extraction_result(channel, user_id, *, combined_text, translated_text, translated_error,
+                                    settings, source_name, output_format, total_images, empty_images,
+                                    extraction_started_at, profile_after, point_source):
+    """يكتب الملفات ويرسل لوحة النتيجة النهائية مع كل الملفات داخلها."""
+    output_dir = BASE_DIR / "data"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    duration_text = format_duration(time.monotonic() - extraction_started_at)
+    format_label = str(output_format).upper()
+    points_label = "رصيد السيرفر" if point_source == "server" else "رصيدك"
+    points_after = profile_after.get("points", 0)
+    target_label = TRANSLATION_TARGETS.get(settings.get("translate_target", "ar"), "العربية")
+
+    main_path = unique_output_path(output_dir, source_name, output_format, ascii_safe=True)
+    if output_format == "docx":
+        main_path.write_bytes(make_docx_bytes(combined_text).getvalue())
+    else:
+        main_path.write_text(combined_text, encoding="utf-8")
+
+    translated_path = None
+    if translated_text:
+        translated_path = unique_output_path(output_dir, f"{source_name}_translated", output_format, ascii_safe=True)
+        if output_format == "docx":
+            translated_path.write_bytes(make_docx_bytes(translated_text).getvalue())
+        else:
+            translated_path.write_text(translated_text, encoding="utf-8")
+
+    warning = None
+    if translated_error:
+        warning = f"تعذّرت الترجمة الأدبية وسأرسل النص الأصلي فقط — السبب: `{translated_error}`"
+
+    translation_info = None
+    if translated_path:
+        translation_info = {"filename": translated_path.name, "target_label": target_label}
+
+    sent = None
+    if V2_SUPPORTED:
+        try:
+            view = result_panel_view(
+                user_id=user_id,
+                total_images=total_images,
+                empty_images=empty_images,
+                duration_text=duration_text,
+                format_label=format_label,
+                points_label=points_label,
+                points_after=points_after,
+                main_name=main_path.name,
+                translation=translation_info,
+                warning=warning,
+            )
+            files = [discord.File(str(main_path))]
+            if translated_path:
+                files.append(discord.File(str(translated_path)))
+            sent = await channel.send(view=view, files=files)
+        except Exception as exc:
+            print(f"[Result] فشل إرسال لوحة Components V2، سيتم استخدام البديل: {exc}")
+            sent = None
+
+    if sent is None:
+        # بديل احتياطي — إعادة إنشاء الملفات لأنها قد تكون استُهلكت في المحاولة الأولى
+        files = [discord.File(str(main_path))]
+        if translated_path:
+            files.append(discord.File(str(translated_path)))
+        sections = [
+            f"## {emoji_manager.placeholder('circlecheck')} تم استخراج الفصل",
+            f"{emoji_manager.placeholder('user')} **المستخدم:** <@{user_id}>",
+            f"{emoji_manager.placeholder('chartpie')} **تقرير الجودة:**\n"
+            f"> الصور الفارغة: `{empty_images}` من `{total_images}`\n"
+            f"> مدة المعالجة: `{duration_text}`\n"
+            f"> صيغة الناتج: `{format_label}`",
+            f"{emoji_manager.placeholder('star')} تم خصم نقطة واحدة من {points_label}. المتبقي: `{points_after}`.",
+        ]
+        if warning:
+            sections.append(f"{emoji_manager.placeholder('alerttriangle')} {warning}")
+        embed = themed_embed(description="\n\n".join(sections))
+        sent = await channel.send(embed=embed, files=files)
+
+    try:
+        os.remove(main_path)
+    except OSError:
+        pass
+    if translated_path:
+        try:
+            os.remove(translated_path)
+        except OSError:
+            pass
+    return sent
 
 STATUS_HEARTBEAT_SECONDS = 20
 
@@ -328,8 +472,8 @@ def build_extraction_prompt(settings):
     يبني برومبت الاستخراج بناءً على إعدادات المستخدم.
     صياغة إلزامية صارمة لضمان الامتثال الكامل.
     """
-    # المؤثرات الصوتية — صياغة إلزامية قاطعة
-    if settings.get("include_sfx", True):
+    # المؤثرات الصوتية — معطّلة افتراضيًا (تجاهل تام ما لم يفعّلها المستخدم)
+    if settings.get("include_sfx", False):
         sfx_rule = (
             "Include all sound effects, onomatopoeia, and side text exactly as they appear."
         )
@@ -370,6 +514,156 @@ def build_extraction_prompt(settings):
         "7. If the image contains no readable text or no text at all, "
         "output exactly this and nothing else: [no text extracted — retry]"
     )
+
+
+# ============================================================
+# الترجمة الأدبية — مرحلة ثانية نصية فقط بدون صور
+# ============================================================
+TRANSLATION_TARGETS = {
+    "ar": "العربية",
+    "en": "English",
+    "fr": "Français",
+    "es": "Español",
+    "tr": "Türkçe",
+    "id": "Bahasa Indonesia",
+}
+
+
+def build_translation_prompt(target_language):
+    """برومبت ترجمة أدبية احترافية مخصص لفصول المانهوا — كل سطر فقاعة مستقلة."""
+    lang = TRANSLATION_TARGETS.get(target_language, TRANSLATION_TARGETS["ar"])
+    return (
+        "You are a professional literary translator specialized in manhwa and manga. "
+        f"You will receive the extracted text of one complete manhwa chapter. "
+        f"Translate it into {lang} with professional, literary quality "
+        "worthy of an official published release.\n\n"
+        "CRITICAL FORMAT RULES:\n"
+        "1. This is a MANHWA chapter. Every single line of the input is ONE "
+        "independent speech bubble. Never try to merge bubbles together.\n"
+        "2. Keep EXACTLY the same number of lines, in EXACTLY the same order as "
+        "the input. One input line becomes one output line.\n"
+        "3. Lines that start with '## ' are image separators (page filenames), "
+        "they are NOT dialogue. Copy them EXACTLY as they are, character for "
+        "character, without translating or altering them.\n"
+        "4. Preserve blank lines exactly as they appear in the input.\n"
+        "5. Output ONLY the translated text. No commentary, no notes, no "
+        "explanations, no headers, no numbering.\n\n"
+        "LITERARY STYLE:\n"
+        "- Natural, fluent, idiomatic prose — never literal or stiff translation.\n"
+        "- Keep every character's voice, tone and register consistent across the "
+        "whole chapter.\n"
+        "- Adapt idioms and expressions naturally to the target language.\n"
+        "- Transliterate character and place names consistently.\n"
+        "- Sound effects may be rendered expressively in the target language.\n"
+        "- Translate everything faithfully; do not censor, summarize or skip lines."
+    )
+
+
+def _strip_code_fences(text):
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text)
+    return text.strip()
+
+
+def request_qwen_text_completion(user_id, prompt, *, service_type="chat", max_attempts=3):
+    """
+    طلب محادثة نصي فقط (بدون أي صور) إلى Qwen مع إعادة محاولات محدودة.
+    يُستخدم لمرحلة الترجمة الأدبية بعد انتهاء الاستخراج.
+    """
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            chat_id = create_new_chat(user_id, service_type)
+            url = f"{BASE_QWEN_URL}/chat/completions?chat_id={chat_id}"
+            headers = get_qwen_headers(user_id, service_type)
+            headers['x-request-id'] = str(uuid.uuid4())
+            headers['Accept'] = "*/*,text/event-stream"
+
+            message_data = {
+                "chat_type": "t2t",
+                "content": prompt,
+                "role": "user",
+                "feature_config": {
+                    "output_schema": "phase",
+                    "thinking_enabled": False,
+                    "thinking_format": "summary",
+                    "auto_thinking": False,
+                    "auto_search": False,
+                },
+                "timestamp": int(time.time()),
+                "sub_chat_type": "t2t",
+                "models": ["qwen3.8-max"],
+                "user_action": "chat",
+                "extra": {"meta": {"subChatType": "t2t"}},
+                "files": [],
+            }
+            payload = {
+                "stream": True,
+                "incremental_output": True,
+                "chat_id": chat_id,
+                "chat_mode": "normal",
+                "model": "qwen3.8-max",
+                "messages": [message_data],
+                "timestamp": int(time.time()),
+                "share_id": "",
+                "version": "2.1",
+                "origin_branch_message_id": "",
+            }
+
+            response = requests.post(url, json=payload, headers=headers, stream=True, timeout=300)
+            full_response = ""
+            rate_limited = False
+            for line_item in response.iter_lines():
+                if not line_item:
+                    continue
+                line_str = line_item.decode("utf-8")
+                if is_rate_limited_response(line_str):
+                    rate_limited = True
+                    break
+                if line_str.startswith("data: "):
+                    data_content = line_str[6:].strip()
+                    if data_content == "[DONE]":
+                        break
+                    try:
+                        data_json = json.loads(data_content)
+                    except Exception:
+                        continue
+                    if is_rate_limited_response(data_json):
+                        rate_limited = True
+                        break
+                    if "choices" in data_json and data_json["choices"]:
+                        delta = data_json["choices"][0].get("delta", {})
+                        if delta.get("phase") == "answer" and delta.get("content"):
+                            full_response += delta["content"]
+
+            if rate_limited:
+                mark_account_rate_limited(user_id, service_type)
+                last_error = Exception("تم تجاوز حد الاستخدام على حساب Qwen الحالي.")
+                time.sleep(2 * attempt)
+                continue
+
+            cleaned = _strip_code_fences(_sanitize_extraction(full_response))
+            if cleaned and cleaned != _EXTRACTION_FAILED_MARKER:
+                return cleaned
+            last_error = Exception("جاء رد الترجمة فارغًا أو غير صالح من الموديل.")
+        except Exception as exc:
+            last_error = exc
+            time.sleep(2 * attempt)
+    raise last_error or Exception("فشل طلب Qwen النصي بعد عدة محاولات.")
+
+
+def translate_chapter_text(user_id, chapter_text, settings):
+    """يترجم نص الفصل المستخرج أدبيًا عبر Qwen — نص فقط بدون صور."""
+    target = (settings or {}).get("translate_target", "ar")
+    prompt = (
+        build_translation_prompt(target)
+        + "\n\n=== CHAPTER TEXT START ===\n"
+        + chapter_text.strip()
+        + "\n=== CHAPTER TEXT END ==="
+    )
+    return request_qwen_text_completion(user_id, prompt)
 
 
 # ============================================================
@@ -933,8 +1227,11 @@ def sanitize_output_stem(value, default="zeus"):
     value = re.sub(r"\s+", "_", value).strip("._")
     return (value or default)[:80]
 
-def unique_output_path(directory, stem, suffix):
+def unique_output_path(directory, stem, suffix, ascii_safe=False):
     stem = sanitize_output_stem(stem)
+    if ascii_safe:
+        # أسماء مرفقات Components V2 يجب أن تكون ASCII لتعمل إشارة attachment://
+        stem = re.sub(r"[^A-Za-z0-9_-]+", "_", stem).strip("_") or "zeus"
     candidate = directory / f"{stem}.{suffix}"
     counter = 2
     while candidate.exists():
@@ -1256,10 +1553,22 @@ class AccountsView(discord.ui.View):
 
 
 class AccountDetailView(discord.ui.View):
+    _BUTTON_EMOJIS = {
+        "تعيين كخدمة نشطة": "bookmark",
+        "تجديد التوكن": "clock",
+        "فك الحظر": "tv_unlock",
+        "حذف الحساب": "trash",
+    }
+
     def __init__(self, user_id, acc_idx):
         super().__init__(timeout=180)
         self.user_id = user_id
         self.acc_idx = acc_idx
+        # إعادة تطبيق الإيموجي المخصص وقت التشغيل (المزخرفات تُقيّم عند الاستيراد قبل تحميل الإيموجيات)
+        for child in self.children:
+            emoji_key = self._BUTTON_EMOJIS.get(getattr(child, "label", ""))
+            if emoji_key:
+                child.emoji = emoji_manager.partial(emoji_key)
 
     @discord.ui.button(label="تعيين كخدمة نشطة", emoji=emoji_manager.partial("bookmark"), style=discord.ButtonStyle.secondary)
     async def set_active(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1325,212 +1634,278 @@ class AccountDetailView(discord.ui.View):
 # ============================================================
 # واجهات المستخدم: الإعدادات والملف الشخصي ونظام النقاط
 # ============================================================
-class SettingsView(discord.ui.View):
+# ============================================================
+# لوحة الإعدادات — Components V2 احترافية بأقسام على شكل صفحات
+# ============================================================
+SETTINGS_PAGE_HOME = "home"
+SETTINGS_PAGE_EXTRACTION = "extraction"
+SETTINGS_PAGE_TRANSLATION = "translation"
+
+SEPARATOR_LABEL = "اسم الصورة الأصلية (ثابت)"
+
+
+class SettingsPanel(discord.ui.LayoutView):
+    """
+    لوحة إعدادات فاخرة بنظام Components V2:
+    - الصفحة الرئيسية: شرح الأمر وأقسامه + سيلكت منيو لاختيار القسم
+    - صفحة الاستخراج: صيغة الناتج، المسافات، المؤثرات، الفاصل
+    - صفحة الترجمة: تفعيل الترجمة الأدبية واختيار اللغة
+    - زر رجوع في كل صفحة فرعية
+    - علنية (غير خاصة) — لكن التغيير لصاحب اللوحة فقط
+    """
+
     def __init__(self, user):
-        super().__init__(timeout=300)
+        super().__init__(timeout=900)
         self.user = user
         self.profile = get_user_profile(user)
-        self._rebuild()
+        self.page = SETTINGS_PAGE_HOME
+        self.build()
 
-    def _rebuild(self):
-        self.clear_items()
-        s = self.profile["settings"]
-
-        # صيغة الملف
-        fmt_select = discord.ui.Select(
-            placeholder="📄 صيغة الملف",
-            custom_id="fmt",
-            row=0,
-            options=[
-                discord.SelectOption(
-                    label="TXT — ملف نص عادي",
-                    value="txt",
-                    emoji="📄",
-                    default=s.get("output_format", "txt") == "txt",
-                ),
-                discord.SelectOption(
-                    label="DOCX — ملف Word",
-                    value="docx",
-                    emoji="📝",
-                    default=s.get("output_format", "txt") == "docx",
-                ),
-            ],
-        )
-        fmt_select.callback = self.on_format_select
-        self.add_item(fmt_select)
-
-        # مسافات الفقاعات
-        spacing_select = discord.ui.Select(
-            placeholder="↕️ مسافات بين الفقاعات",
-            custom_id="spacing",
-            row=1,
-            options=[
-                discord.SelectOption(
-                    label="مفعّل — سطر فارغ بين كل فقاعة",
-                    value="on",
-                    emoji="✅",
-                    default=s.get("bubble_spacing", True) is True,
-                ),
-                discord.SelectOption(
-                    label="معطّل — نص متصل بدون فراغات",
-                    value="off",
-                    emoji="❌",
-                    default=s.get("bubble_spacing", True) is False,
-                ),
-            ],
-        )
-        spacing_select.callback = self.on_spacing_select
-        self.add_item(spacing_select)
-
-        # المؤثرات الصوتية
-        sfx_select = discord.ui.Select(
-            placeholder="🔊 المؤثرات الصوتية",
-            custom_id="sfx",
-            row=2,
-            options=[
-                discord.SelectOption(
-                    label="مفعّل — استخراج المؤثرات والأصوات",
-                    value="on",
-                    emoji="🔊",
-                    default=s.get("include_sfx", True) is True,
-                ),
-                discord.SelectOption(
-                    label="معطّل — تجاهل المؤثرات تمامًا",
-                    value="off",
-                    emoji="🔇",
-                    default=s.get("include_sfx", True) is False,
-                ),
-            ],
-        )
-        sfx_select.callback = self.on_sfx_select
-        self.add_item(sfx_select)
-
-        # فاصل الصور
-        sep_mode = s.get("separator_mode", "original_name")
-        separator_select = discord.ui.Select(
-            placeholder="📌 فاصل الصور",
-            custom_id="separator_mode",
-            row=3,
-            options=[
-                discord.SelectOption(
-                    label="اسم الصورة الأصلية",
-                    value="original_name",
-                    emoji="🖼️",
-                    description="مثال: ## chapter_01_page_05.jpg",
-                    default=sep_mode == "original_name",
-                ),
-                discord.SelectOption(
-                    label="ترقيم بسيط",
-                    value="simple_index",
-                    emoji="🔢",
-                    description="مثال: ## صورة 1",
-                    default=sep_mode == "simple_index",
-                ),
-                discord.SelectOption(
-                    label="قالب مخصص",
-                    value="custom",
-                    emoji="✏️",
-                    description="تحديد القالب يدويًا",
-                    default=sep_mode == "custom",
-                ),
-            ],
-        )
-        separator_select.callback = self.on_separator_select
-        self.add_item(separator_select)
-
-        # زر فتح Modal القالب المخصص
-        template_btn = discord.ui.Button(
-            label="تعديل قالب الفاصل المخصص",
-            emoji="✏️",
-            style=discord.ButtonStyle.secondary,
-            custom_id="separator_template",
-            row=4,
-        )
-        template_btn.callback = self.open_separator_template
-        self.add_item(template_btn)
-
+    # ---------- أدوات مساعدة ----------
     async def _guard(self, interaction):
         if interaction.user.id != self.user.id:
-            await interaction.response.send_message("{emoji:lock} هذه اللوحة ليست لك.", ephemeral=True)
+            await interaction.response.send_message(
+                "{emoji:lock} هذه اللوحة ليست لك، افتح نسختك الخاصة عبر `/setting`.",
+                ephemeral=True,
+            )
             return False
         return True
 
-    def embed(self):
-        s = self.profile["settings"]
-        return themed_embed(
-            title="{emoji:settings} لوحة إعدادات الاستخراج",
-            description=(
-                f"## إعداداتك الحالية\n{line()}\n"
-                f"📄 **صيغة الملف:** `{s.get('output_format', 'txt').upper()}`\n"
-                f"↕️ **مسافات بين الفقاعات:** `{fmt_bool(s.get('bubble_spacing', True))}`\n"
-                f"🔊 **المؤثرات الصوتية:** `{fmt_bool(s.get('include_sfx', True))}`\n"
-                f"📌 **فاصل الصور:** `{SEPARATOR_MODES.get(s.get('separator_mode', 'original_name'), SEPARATOR_MODES['original_name'])}`\n"
-                f"✏️ **قالب الفاصل:** `{s.get('separator_template') or DEFAULT_SEPARATOR_TEMPLATE}`\n\n"
-                "استخدم `{name}` لاسم الصورة و`{index}` لرقم الصورة في القالب المخصص."
-            ),
-            color_name="gold",
+    def _settings(self):
+        return self.profile["settings"]
+
+    def _target_label(self):
+        return TRANSLATION_TARGETS.get(self._settings().get("translate_target", "ar"), "العربية")
+
+    def _add_sections(self, container, sections):
+        for idx, part in enumerate(sections):
+            if idx:
+                container.add_item(discord.ui.Separator(visible=True))
+            container.add_item(discord.ui.TextDisplay(emojize(part)))
+
+    def _add_back_row(self, container):
+        back_row = discord.ui.ActionRow()
+        back_btn = discord.ui.Button(
+            label="رجوع للصفحة الرئيسية",
+            style=discord.ButtonStyle.secondary,
         )
+        back_btn.callback = self.on_back
+        back_row.add_item(back_btn)
+        container.add_item(back_row)
+
+    # ---------- بناء الصفحات ----------
+    def build(self):
+        self.clear_items()
+        container = discord.ui.Container(accent_colour=discord.Colour(THEMES["gold"]["color"]))
+        if self.page == SETTINGS_PAGE_HOME:
+            self._build_home(container)
+        elif self.page == SETTINGS_PAGE_EXTRACTION:
+            self._build_extraction(container)
+        else:
+            self._build_translation(container)
+        self.add_item(container)
+
+    def _build_home(self, container):
+        self._add_sections(container, [
+            "# {emoji:settings} مركز إعدادات ZEUS Text",
+            (
+                "> أهلاً بك في لوحة التحكم الكاملة ببوت استخراج نصوص المانهوا.\n"
+                "> من هنا تدير كل ما يخص نتائجك: **صيغة الملف، طريقة الاستخراج، وميزة الترجمة الأدبية**.\n"
+                "> **اختر القسم الذي تريده من قائمة الاختيار بالأسفل.**"
+            ),
+            (
+                "### {emoji:photo} قسم الاستخراج\n"
+                "> صيغة الناتج `TXT/DOCX` • المسافات بين الفقاعات • المؤثرات الصوتية • فاصل الصور."
+            ),
+            (
+                "### {emoji:message} قسم الترجمة\n"
+                "> تفعيل **الترجمة الأدبية الاحترافية** واختيار لغة الترجمة — معطّلة افتراضيًا."
+            ),
+            "-# اللوحة عامة ويمكن للجميع رؤيتها، لكن تعديل الإعدادات متاح لصاحب الأمر فقط.",
+        ])
+        select_row = discord.ui.ActionRow()
+        select = discord.ui.Select(
+            placeholder="اختر قسم الإعدادات...",
+            options=[
+                discord.SelectOption(
+                    label="قسم الاستخراج",
+                    value=SETTINGS_PAGE_EXTRACTION,
+                    description="صيغة الناتج والمسافات والمؤثرات والفاصل",
+                    emoji=emoji_manager.partial("photo"),
+                ),
+                discord.SelectOption(
+                    label="قسم الترجمة",
+                    value=SETTINGS_PAGE_TRANSLATION,
+                    description="الترجمة الأدبية ولغة الترجمة",
+                    emoji=emoji_manager.partial("message"),
+                ),
+            ],
+        )
+        select.callback = self.on_section_select
+        select_row.add_item(select)
+        container.add_item(select_row)
+
+    def _build_extraction(self, container):
+        s = self._settings()
+        self._add_sections(container, [
+            "# {emoji:photo} قسم الاستخراج",
+            "> تحكم بكل تفاصيل ناتج الاستخراج من هنا. كل تغيير يُحفظ **فورًا** على حسابك ويُطبق على الفصول القادمة.",
+            (
+                f"### {emoji_manager.placeholder('list')} صيغة الناتج — الحالية: `{s.get('output_format', 'txt').upper()}`\n"
+                "> - **TXT** — ملف نصي عادي، خفيف ومتوافق مع كل الأجهزة والبرامج.\n"
+                "> - **DOCX** — ملف Word منسق، كل فقاعة تظهر كفقرة مستقلة جاهزة للتحرير."
+            ),
+            (
+                f"### {emoji_manager.placeholder('infocircle')} المسافات بين الفقاعات — الحالية: `{fmt_bool(s.get('bubble_spacing', True))}`\n"
+                "> - **مفعّل:** سطر فارغ بين كل فقاعة حوار لقراءة مريحة.\n"
+                "> - **معطّل:** نص متصل بدون فراغات."
+            ),
+            (
+                f"### {emoji_manager.placeholder('bellringing')} المؤثرات الصوتية — الحالية: `{fmt_bool(s.get('include_sfx', False))}`\n"
+                "> - **معطّل (الافتراضي والموصى به):** تجاهل تام لأصوات مثل `بووم!` و`كراش!` والكلمات الجانبية، ويُخرج الحوار فقط.\n"
+                "> - **مفعّل:** استخراج المؤثرات والأصوات والنصوص الجانبية كما تظهر في الصورة."
+            ),
+            (
+                f"### {emoji_manager.placeholder('bookmark')} فاصل الصور — `{SEPARATOR_LABEL}`\n"
+                "> يبدأ نص كل صفحة بسطر `## اسم الصورة` داخل الملف لتنظيم الصفحات — هذا الإعداد ثابت ولا يمكن تغييره."
+            ),
+        ])
+        fmt_row = discord.ui.ActionRow()
+        fmt_select = discord.ui.Select(
+            placeholder="صيغة الناتج",
+            options=[
+                discord.SelectOption(label="TXT — ملف نص عادي", value="txt", emoji="📄", default=s.get("output_format", "txt") == "txt"),
+                discord.SelectOption(label="DOCX — ملف Word", value="docx", emoji="📝", default=s.get("output_format", "txt") == "docx"),
+            ],
+        )
+        fmt_select.callback = self.on_format_select
+        fmt_row.add_item(fmt_select)
+        container.add_item(fmt_row)
+
+        spacing_row = discord.ui.ActionRow()
+        spacing_select = discord.ui.Select(
+            placeholder="المسافات بين الفقاعات",
+            options=[
+                discord.SelectOption(label="مفعّل — سطر فارغ بين كل فقاعة", value="on", emoji="✅", default=s.get("bubble_spacing", True) is True),
+                discord.SelectOption(label="معطّل — نص متصل بدون فراغات", value="off", emoji="❌", default=s.get("bubble_spacing", True) is False),
+            ],
+        )
+        spacing_select.callback = self.on_spacing_select
+        spacing_row.add_item(spacing_select)
+        container.add_item(spacing_row)
+
+        sfx_row = discord.ui.ActionRow()
+        sfx_select = discord.ui.Select(
+            placeholder="المؤثرات الصوتية",
+            options=[
+                discord.SelectOption(label="مفعّل — استخراج المؤثرات والأصوات", value="on", emoji="🔊", default=s.get("include_sfx", False) is True),
+                discord.SelectOption(label="معطّل — تجاهل المؤثرات تمامًا (افتراضي)", value="off", emoji="🔇", default=s.get("include_sfx", False) is False),
+            ],
+        )
+        sfx_select.callback = self.on_sfx_select
+        sfx_row.add_item(sfx_select)
+        container.add_item(sfx_row)
+
+        self._add_back_row(container)
+
+    def _build_translation(self, container):
+        s = self._settings()
+        enabled = bool(s.get("translate_enabled", False))
+        self._add_sections(container, [
+            "# {emoji:message} قسم الترجمة الأدبية",
+            (
+                "> ميزة اختيارية: بعد انتهاء الاستخراج يُعاد إرسال النص كاملًا إلى **Qwen** في مرحلة ثانية — "
+                "**نص فقط بدون أي صور** — ببرومبت ترجمة مخصص يُعلمه أن هذا فصل مانهوا وكل سطر فقاعة حوار "
+                "مستقلة فلا يحاول دمجها، مع طلب **ترجمة أدبية احترافية**.\n"
+                "> عند التفعيل يصلك **ملف ثانٍ مترجم** بجانب ملف النص الأصلي."
+            ),
+            (
+                f"### {emoji_manager.placeholder('bolt')} حالة الميزة — الحالية: `{fmt_bool(enabled)}`\n"
+                "> - **مفعّل:** تترجم كل فصل تلقائيًا بعد استخراجه (تزيد مدة التنفيذ قليلًا).\n"
+                "> - **معطّل (الافتراضي):** استخراج فقط بدون أي ترجمة."
+            ),
+            (
+                f"### {emoji_manager.placeholder('infocircle')} لغة الترجمة — الحالية: `{self._target_label()}`\n"
+                "> اللغة التي ستُترجم إليها الفصول عند تفعيل الميزة."
+            ),
+        ])
+        toggle_row = discord.ui.ActionRow()
+        toggle_select = discord.ui.Select(
+            placeholder="حالة الترجمة",
+            options=[
+                discord.SelectOption(label="مفعّلة — ترجمة كل فصل بعد استخراجه", value="on", emoji="🌐", default=enabled),
+                discord.SelectOption(label="معطّلة — استخراج فقط (افتراضي)", value="off", emoji="🚫", default=not enabled),
+            ],
+        )
+        toggle_select.callback = self.on_translate_toggle
+        toggle_row.add_item(toggle_select)
+        container.add_item(toggle_row)
+
+        lang_row = discord.ui.ActionRow()
+        lang_select = discord.ui.Select(
+            placeholder="لغة الترجمة",
+            options=[
+                discord.SelectOption(label=f"الترجمة إلى {name}", value=code, default=code == s.get("translate_target", "ar"))
+                for code, name in TRANSLATION_TARGETS.items()
+            ],
+        )
+        lang_select.callback = self.on_translate_lang
+        lang_row.add_item(lang_select)
+        container.add_item(lang_row)
+
+        self._add_back_row(container)
+
+    # ---------- الأحداث ----------
+    async def _refresh(self, interaction):
+        self.build()
+        await interaction.response.edit_message(view=self)
+
+    async def on_section_select(self, interaction: discord.Interaction):
+        if not await self._guard(interaction):
+            return
+        self.page = interaction.data["values"][0]
+        await self._refresh(interaction)
+
+    async def on_back(self, interaction: discord.Interaction):
+        if not await self._guard(interaction):
+            return
+        self.page = SETTINGS_PAGE_HOME
+        await self._refresh(interaction)
 
     async def on_format_select(self, interaction: discord.Interaction):
         if not await self._guard(interaction):
             return
         self.profile = update_user_settings(self.user, output_format=interaction.data["values"][0])
-        self._rebuild()
-        await interaction.response.edit_message(embed=self.embed(), view=self)
+        await self._refresh(interaction)
 
     async def on_spacing_select(self, interaction: discord.Interaction):
         if not await self._guard(interaction):
             return
         self.profile = update_user_settings(self.user, bubble_spacing=interaction.data["values"][0] == "on")
-        self._rebuild()
-        await interaction.response.edit_message(embed=self.embed(), view=self)
+        await self._refresh(interaction)
 
     async def on_sfx_select(self, interaction: discord.Interaction):
         if not await self._guard(interaction):
             return
         self.profile = update_user_settings(self.user, include_sfx=interaction.data["values"][0] == "on")
-        self._rebuild()
-        await interaction.response.edit_message(embed=self.embed(), view=self)
+        await self._refresh(interaction)
 
-    async def on_separator_select(self, interaction: discord.Interaction):
+    async def on_translate_toggle(self, interaction: discord.Interaction):
         if not await self._guard(interaction):
             return
-        self.profile = update_user_settings(self.user, separator_mode=interaction.data["values"][0])
-        self._rebuild()
-        await interaction.response.edit_message(embed=self.embed(), view=self)
+        self.profile = update_user_settings(self.user, translate_enabled=interaction.data["values"][0] == "on")
+        await self._refresh(interaction)
 
-    async def open_separator_template(self, interaction: discord.Interaction):
+    async def on_translate_lang(self, interaction: discord.Interaction):
         if not await self._guard(interaction):
             return
-        await interaction.response.send_modal(SeparatorTemplateModal(self))
-
-
-class SeparatorTemplateModal(discord.ui.Modal, title="فاصل صور مخصص"):
-    template = discord.ui.TextInput(
-        label="اكتب قالب الفاصل",
-        placeholder="مثال: ## صفحة {index} - {name}",
-        max_length=120,
-        required=True,
-    )
-
-    def __init__(self, settings_view):
-        super().__init__(timeout=180)
-        self.settings_view = settings_view
-        self.template.default = settings_view.profile["settings"].get("separator_template") or DEFAULT_SEPARATOR_TEMPLATE
-
-    async def on_submit(self, interaction):
-        if not await self.settings_view._guard(interaction):
-            return
-        value = str(self.template.value).strip() or DEFAULT_SEPARATOR_TEMPLATE
-        self.settings_view.profile = update_user_settings(
-            self.settings_view.user, separator_mode="custom", separator_template=value
-        )
-        self.settings_view._rebuild()
-        await interaction.response.edit_message(embed=self.settings_view.embed(), view=self.settings_view)
+        self.profile = update_user_settings(self.user, translate_target=interaction.data["values"][0])
+        await self._refresh(interaction)
 
 
 def profile_embed(user, profile):
     settings = profile["settings"]
+    target_label = TRANSLATION_TARGETS.get(settings.get("translate_target", "ar"), "العربية")
     embed = themed_embed(
         title="{emoji:user} بروفايل المستخدم",
         description=(
@@ -1540,8 +1915,10 @@ def profile_embed(user, profile):
             f"{emoji_manager.placeholder('shield')} **الحالة:** `{'محظور' if profile.get('is_blocked') else 'نشط'}`\n{line()}\n"
             f"{emoji_manager.placeholder('settings')} **الإخراج:** `{settings.get('output_format', 'txt').upper()}` | "
             f"**المسافات:** `{fmt_bool(settings.get('bubble_spacing', True))}` | "
-            f"**المؤثرات:** `{fmt_bool(settings.get('include_sfx', True))}` | "
-            f"**الفاصل:** `{SEPARATOR_MODES.get(settings.get('separator_mode', 'original_name'), SEPARATOR_MODES['original_name'])}`"
+            f"**المؤثرات:** `{fmt_bool(settings.get('include_sfx', False))}` | "
+            f"**الفاصل:** `{SEPARATOR_LABEL}`\n{line()}\n"
+            f"{emoji_manager.placeholder('message')} **الترجمة الأدبية:** `{fmt_bool(settings.get('translate_enabled', False))}` | "
+            f"**اللغة:** `{target_label}`"
         ),
         color_name="purple",
     )
@@ -1560,16 +1937,28 @@ async def on_ready():
         print(f"تمت مزامنة {len(synced)} أمر.")
     except Exception as e:
         print(f"فشل مزامنة الأوامر: {e}")
-    if os.getenv("SYNC_APPLICATION_EMOJIS", "true").lower() == "true":
+    # نظام الإيموجي المخصص:
+    # - يُحمّل أولاً من utils/emojis.json إذا كان مطابقًا لتطبيق هذا البوت.
+    # - إذا كانت الخريطة فارغة (لا إيموجيات مخصصة) تُجبر المزامنة على العمل
+    #   حتى لو كان SYNC_APPLICATION_EMOJIS=false، لأن بدونها ستظهر الإيموجيات العادية.
+    # - تُنفذ مرة واحدة فقط لكل جلسة (on_ready قد يتكرر مع إعادة الاتصال).
+    if not getattr(bot, "_zeus_emoji_setup_done", False):
+        bot._zeus_emoji_setup_done = True
         try:
-            result = await asyncio.to_thread(emoji_manager.sync_application_emojis, bot.user.id, BOT_TOKEN)
             emoji_manager.load(bot.user.id)
-            print(f"[EmojiSetup] {result}")
+            sync_enabled = os.getenv("SYNC_APPLICATION_EMOJIS", "true").lower() == "true"
+            has_custom = any(not key.startswith("__") for key in emoji_manager.map)
+            if sync_enabled or not has_custom:
+                if not sync_enabled:
+                    print("[EmojiSetup] الخريطة فارغة وستُجبر المزامنة رغم تعطيل الإعداد.")
+                result = await asyncio.to_thread(emoji_manager.sync_application_emojis, bot.user.id, BOT_TOKEN)
+                emoji_manager.load(bot.user.id)
+                print(f"[EmojiSetup] {result}")
+            else:
+                print(f"[EmojiSetup] تم تحميل {sum(1 for k in emoji_manager.map if not k.startswith('__'))} إيموجي مخصص من الذاكرة المحلية.")
         except Exception as e:
             emoji_manager.load(bot.user.id)
             print(f"[EmojiSetup] failed: {e}")
-    else:
-        emoji_manager.load(bot.user.id)
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="ZEUS Text | /help"))
 
 
@@ -1692,50 +2081,100 @@ async def extract(interaction: discord.Interaction):
             await edit_status(status_msg, "{emoji:circlex} خطأ أثناء المعالجة", f"الصورة `{idx}`: `{str(e)}`", error=True)
             return
 
+    # مرحلة الترجمة الأدبية (اختيارية — معطلة افتراضيًا)
+    translated_text = None
+    translated_error = None
+    if settings.get("translate_enabled", False) and combined_text.strip():
+        await edit_status(
+            status_msg,
+            "جاري الترجمة الأدبية",
+            "أُرسل نص الاستخراج إلى Qwen مرة أخرى للترجمة — نص فقط بدون صور، وقد تطول العملية قليلًا حسب طول الفصل.",
+        )
+        try:
+            translated_text = await asyncio.to_thread(translate_chapter_text, user_id, combined_text, settings)
+        except Exception as exc:
+            translated_error = str(exc)
+
     ok, profile_after, point_source = await resolve_and_consume_point(user_id, guild_id)
     if not ok:
         await edit_status(status_msg, "{emoji:circlex} لا توجد نقاط", "لا توجد نقاط كافية لإرسال النتيجة.", error=True)
         return
 
-    output_dir = BASE_DIR / "data"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_format = settings.get("output_format", "txt")
-    filename = unique_output_path(output_dir, source_name, output_format)
-    if output_format == "docx":
-        filename.write_bytes(make_docx_bytes(combined_text).getvalue())
-    else:
-        filename.write_text(combined_text, encoding="utf-8")
-
-    file = discord.File(str(filename))
     await status_msg.close(delete=True)
-
-    points_label = "رصيد السيرفر" if point_source == "server" else "رصيدك"
-    await send_panel(
+    await deliver_extraction_result(
         interaction.channel,
-        sections=[
-            f"## {emoji_manager.placeholder('circlecheck')} تم استخراج الفصل بنجاح",
-            f"{emoji_manager.placeholder('photo')} تمت معالجة `{total_images}` صورة وإرفاق ملف `{filename.name}`.",
-            f"{emoji_manager.placeholder('chartpie')} تقرير الجودة: الصور الفارغة `{empty_images}`، مدة المعالجة `{format_duration(time.monotonic() - extraction_started_at)}`، الصيغة `{output_format.upper()}`.",
-            f"{emoji_manager.placeholder('bookmark')} فاصل الإخراج: `{SEPARATOR_MODES.get(settings.get('separator_mode', 'original_name'), SEPARATOR_MODES['original_name'])}`.",
-            f"{emoji_manager.placeholder('star')} تم خصم نقطة واحدة من {points_label}. المتبقي: `{profile_after.get('points', 0)}`.",
-        ],
-        content=f"{interaction.user.mention} {emoji_manager.placeholder('circlecheck')} انتهى استخراج الفصل.",
-        file=file,
+        user_id,
+        combined_text=combined_text,
+        translated_text=translated_text,
+        translated_error=translated_error,
+        settings=settings,
+        source_name=source_name,
+        output_format=settings.get("output_format", "txt"),
+        total_images=total_images,
+        empty_images=empty_images,
+        extraction_started_at=extraction_started_at,
+        profile_after=profile_after,
+        point_source=point_source,
     )
-    os.remove(filename)
     increment_account_usage(user_id, "ocr")
 
 
-@bot.tree.command(name="help", description="تعليمات استخدام البوت")
-async def help_command(interaction: discord.Interaction):
-    sections = [
-        f"# {emoji_manager.placeholder('photo')} ZEUS Text Bot",
-        "بوت احترافي لاستخراج نصوص المانجا والمانهوا مع نظام نقاط وإعدادات إخراج شخصية.",
-        f"{emoji_manager.placeholder('playerplay')} **/extract**\nيبدأ استخراج فصل كامل. كل عملية ناجحة تخصم **نقطة واحدة**.",
-        f"{emoji_manager.placeholder('settings')} **/setting**\nلوحة تفاعلية لتغيير TXT/DOCX، مسافات الفقاعات، المؤثرات الصوتية، وفواصل الصور.",
-        f"{emoji_manager.placeholder('user')} **/profile**\nيعرض بروفايلك أو بروفايل شخص آخر بشكل عام مع صورة المستخدم.",
-        f"{emoji_manager.placeholder('ticket')} **تجديد النقاط**\nكل مستخدم يبدأ بـ **5 نقاط مجانية**. عند نفادها افتح تذكرة في السيرفر.",
+def help_sections():
+    """دليل استخدام شامل ومفصل — يشرح ما هو البوت، وكيف يعمل، وخطوات كل أمر."""
+    return [
+        "# {emoji:photo} ZEUS Text Bot — الدليل الشامل",
+        (
+            "> بوت متخصص في **استخراج نصوص المانجا والمانهوا** من الصور تلقائيًا بواسطة الذكاء الاصطناعي، "
+            "ثم يسلّمها لك **ملفًا منظّمًا** داخل الرسالة مباشرة — مع ميزة **ترجمة أدبية احترافية** اختيارية.\n"
+            "> كل فصل يُستخرج بنجاح يستهلك **نقطة واحدة** فقط."
+        ),
+        "## {emoji:playerplay} الأمر `/extract` — الاستخراج خطوة بخطوة",
+        (
+            "> **ماذا يفعل؟** يبدأ جلسة استخراج كاملة لفصل من أول صفحة لآخرها.\n"
+            "> **كيف تعمل؟ اتبع هذه الخطوات بالترتيب:**\n"
+            "> 1️⃣ نفّذ `/extract` وتظهر لك خيارات المعالجة: **سرعة عالية** (موصى به — نتيجة أسرع بدقة ممتازة) "
+            "أو **دقة كاملة** (معالجة أعمق للفصول الصعبة جدًا لكن أبطأ بكثير وقد تصل لـ30 دقيقة).\n"
+            "> 2️⃣ أرسل صور الفصل بإحدى **ثلاث طرق**:\n"
+            "> • إرفاق ما يصل إلى `10` صور مباشرة (رتبها بالأرقام).\n"
+            "> • ملف `ZIP` داخله صور الفصل مرتبة الأسماء.\n"
+            "> • رابط `Google Drive` لمجلد أو ملف — وسيقرأ حتى `1000` صورة.\n"
+            "> 3️⃣ تظهر **لوحة حالة حية** تتحديث مع كل صورة حتى انتهاء الفصل.\n"
+            "> 4️⃣ تصلك لوحة النتيجة: الملف داخلها مباشرة + **تقرير جودة** (الصور الفارغة، المدة، الصيغة).\n"
+            "> **ملاحظات:** النص يُرتّب حسب أسماء الصور (مرّتها = مرتب الناتج)، ويُفصل كل صفحة بسطر `## اسم الصورة`."
+        ),
+        "## {emoji:settings} الأمر `/setting` — الإعدادات",
+        (
+            "> **ماذا يفعل؟** يفتح لوحة إعدادات **علنية** بأقسام على شكل صفحات: تختار القسم من قائمة، وتضغط زر الرجوع للعودة.\n"
+            "> **🖼️ قسم الاستخراج:** صيغة الناتج (`TXT` نص عادي / `DOCX` وورد)، المسافات بين الفقاعات، "
+            "المؤثرات الصوتية (**معطّلة افتراضيًا** لتجاهل الأصوات مثل `بووم!`)، وفاصل الصور (اسم الصورة — ثابت).\n"
+            "> **🌐 قسم الترجمة:** تفعيل الترجمة الأدبية (**معطّلة افتراضيًا**) واختيار اللغة — وستُترجم الفصول تلقائيًا بعد كل استخراج."
+        ),
+        "## {emoji:user} الأمر `/profile` — البروفايل",
+        (
+            "> **ماذا يفعل؟** يعرض بطاقة حسابك: النقاط المتبقية، إجمالي الاستخراجات، الحالة، وملخص إعداداتك الحالية.\n"
+            "> **إضافي:** `/profile @العضو` لعرض بروفايل عضو آخر، ويعمل أيضًا بالبريفكس `!بروفايل`."
+        ),
+        "## {emoji:star} النقاط والتكلفة",
+        (
+            "> كل مستخدم جديد يبدأ بـ **5 نقاط مجانية**.\n"
+            "> كل فصل ناجح = **نقطة واحدة** حتى لو احتوى بعض الصور على نص قليل.\n"
+            "> إذا كان للسيرفر رصيد نقاط مفعّل من الإدارة يُخصم **منه تلقائيًا** قبل رصيدك الشخصي.\n"
+            "> **نفدت نقاطك؟** افتح تذكرة في سيرفر الدعم لتجديدها."
+        ),
+        "## {emoji:alerttriangle} حدود وملاحظات",
+        (
+            "> • الحد الأقصى `10` صور في الرسالة الواحدة — للفصول الطويلة استخدم `ZIP` أو `Google Drive`.\n"
+            "> • الصيغ المدعومة: `PNG` `JPG` `JPEG` `WEBP`.\n"
+            "> • الصورة التي تظهر (فارغة) في التقرير تعني أنها بلا نص مقروء.\n"
+            "> • عند تفعيل الترجمة يُرسل النص إلى Qwen نصيًا بعد الاستخراج، فتطول مدة التنفيذ قليلًا.\n"
+            "> • أوامر البريفكس المتاحة: `!extract` `!اعدادات` `!بروفايل` `!مساعدة`."
+        ),
     ]
+
+
+@bot.tree.command(name="help", description="دليل استخدام البوت الشامل")
+async def help_command(interaction: discord.Interaction):
+    sections = help_sections()
     view = components_v2_panel(sections=sections)
     if view:
         await interaction.response.send_message(view=view)
@@ -1743,10 +2182,22 @@ async def help_command(interaction: discord.Interaction):
         await interaction.response.send_message(embed=themed_embed(description="\n\n".join(sections)))
 
 
-@bot.tree.command(name="setting", description="لوحة إعدادات استخراج النصوص")
+@bot.tree.command(name="setting", description="لوحة إعدادات الاستخراج والترجمة — علنية للجميع")
 async def setting(interaction: discord.Interaction):
-    view = SettingsView(interaction.user)
-    await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
+    if V2_SUPPORTED:
+        await interaction.response.send_message(view=SettingsPanel(interaction.user), ephemeral=False)
+    else:
+        await interaction.response.send_message(
+            embed=themed_embed(
+                title="{emoji:settings} مركز إعدادات ZEUS Text",
+                description=(
+                    "أقسام اللوحة غير مدعومة في نسخة discord.py الحالية.\n"
+                    "حدّث المكتبة إلى `discord.py>=2.6` للحصول على اللوحة التفاعلية الكاملة.\n\n"
+                    "**الإعدادات المتاحة:** صيغة الناتج، المسافات بين الفقاعات، المؤثرات الصوتية، الترجمة الأدبية ولغتها."
+                ),
+            ),
+            ephemeral=False,
+        )
 
 
 @bot.tree.command(name="profile", description="عرض ملفك أو بروفايل شخص آخر في بوت استخراج النصوص")
@@ -1835,8 +2286,24 @@ class AdminActionModal(discord.ui.Modal):
 
 
 class AdminPanelView(discord.ui.View):
+    _BUTTON_EMOJIS = {
+        "المستخدمون": "chartpie",
+        "إضافة نقاط": "star",
+        "ضبط النقاط": "adjustments",
+        "منع": "lock",
+        "فك المنع": "shieldcheck",
+        "نقاط السيرفر": "shieldcheck",
+        "حسابات OCR": "user",
+        "حالة OCR": "infocircle",
+    }
+
     def __init__(self):
         super().__init__(timeout=240)
+        # إعادة تطبيق الإيموجي المخصص وقت التشغيل
+        for child in self.children:
+            emoji_key = self._BUTTON_EMOJIS.get(getattr(child, "label", ""))
+            if emoji_key:
+                child.emoji = emoji_manager.partial(emoji_key)
 
     async def interaction_check(self, interaction):
         if interaction.user.id != OWNER_ID:
@@ -1928,11 +2395,7 @@ async def zx(interaction: discord.Interaction):
 # ============================================================
 @bot.command(name="help", aliases=["مساعدة", "اوامر"])
 async def prefix_help(ctx):
-    sections = [
-        f"# {emoji_manager.placeholder('photo')} ZEUS Text Bot",
-        "استخدم `/extract` أو `!extract` للبدء، و`!اعدادات` للإعدادات، و`!بروفايل` للبروفايل.",
-    ]
-    await send_panel(ctx.channel, sections=sections)
+    await send_panel(ctx.channel, sections=help_sections())
 
 
 @bot.command(name="profile", aliases=["بروفايل"])
@@ -1952,8 +2415,10 @@ async def prefix_profile(ctx, target: Optional[str] = None):
 
 @bot.command(name="setting", aliases=["settings", "اعدادات"])
 async def prefix_setting(ctx):
-    view = SettingsView(ctx.author)
-    await ctx.send(embed=view.embed(), view=view)
+    if V2_SUPPORTED:
+        await ctx.send(view=SettingsPanel(ctx.author))
+    else:
+        await ctx.send(embed=themed_embed("{emoji:settings} مركز إعدادات ZEUS Text", "حدّث المكتبة إلى `discord.py>=2.6` للحصول على اللوحة التفاعلية الكاملة."))
 
 
 @bot.command(name="extract", aliases=["استخراج"])
@@ -2060,36 +2525,41 @@ async def prefix_extract(ctx):
             await edit_status(status_msg, "{emoji:circlex} خطأ أثناء المعالجة", f"الصورة `{idx}`: `{str(e)}`", error=True)
             return
 
+    # مرحلة الترجمة الأدبية (اختيارية — معطلة افتراضيًا)
+    translated_text = None
+    translated_error = None
+    if settings.get("translate_enabled", False) and combined_text.strip():
+        await edit_status(
+            status_msg,
+            "جاري الترجمة الأدبية",
+            "أُرسل نص الاستخراج إلى Qwen مرة أخرى للترجمة — نص فقط بدون صور، وقد تطول العملية قليلًا حسب طول الفصل.",
+        )
+        try:
+            translated_text = await asyncio.to_thread(translate_chapter_text, user_id, combined_text, settings)
+        except Exception as exc:
+            translated_error = str(exc)
+
     ok, profile_after, point_source = await resolve_and_consume_point(user_id, guild_id)
     if not ok:
         await edit_status(status_msg, "{emoji:circlex} لا توجد نقاط", "لا توجد نقاط كافية لإرسال النتيجة.", error=True)
         return
 
-    output_dir = BASE_DIR / "data"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_format = settings.get("output_format", "txt")
-    filename = unique_output_path(output_dir, source_name, output_format)
-    if output_format == "docx":
-        filename.write_bytes(make_docx_bytes(combined_text).getvalue())
-    else:
-        filename.write_text(combined_text, encoding="utf-8")
-
     await status_msg.close(delete=True)
-
-    points_label = "رصيد السيرفر" if point_source == "server" else "رصيدك"
-    await send_panel(
+    await deliver_extraction_result(
         ctx.channel,
-        sections=[
-            f"## {emoji_manager.placeholder('circlecheck')} تم استخراج الفصل بنجاح",
-            f"{emoji_manager.placeholder('photo')} تمت معالجة `{total_images}` صورة وإرفاق ملف `{filename.name}`.",
-            f"{emoji_manager.placeholder('chartpie')} تقرير الجودة: الصور الفارغة `{empty_images}`، مدة المعالجة `{format_duration(time.monotonic() - extraction_started_at)}`، الصيغة `{output_format.upper()}`.",
-            f"{emoji_manager.placeholder('bookmark')} فاصل الإخراج: `{SEPARATOR_MODES.get(settings.get('separator_mode', 'original_name'), SEPARATOR_MODES['original_name'])}`.",
-            f"{emoji_manager.placeholder('star')} تم خصم نقطة واحدة من {points_label}. المتبقي: `{profile_after.get('points', 0)}`.",
-        ],
-        content=f"{ctx.author.mention} {emoji_manager.placeholder('circlecheck')} انتهى استخراج الفصل.",
-        file=discord.File(str(filename)),
+        user_id,
+        combined_text=combined_text,
+        translated_text=translated_text,
+        translated_error=translated_error,
+        settings=settings,
+        source_name=source_name,
+        output_format=settings.get("output_format", "txt"),
+        total_images=total_images,
+        empty_images=empty_images,
+        extraction_started_at=extraction_started_at,
+        profile_after=profile_after,
+        point_source=point_source,
     )
-    os.remove(filename)
     increment_account_usage(user_id, "ocr")
 
 
