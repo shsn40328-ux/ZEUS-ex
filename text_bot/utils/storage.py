@@ -189,21 +189,20 @@ def get_guild_profile(guild_id):
 
 
 def server_has_points(guild_id):
-    """يتحقق إذا كان السيرفر مفعّلًا لنقاط السيرفر ولديه نقاط > 0"""
+    """يتحقق إذا كان السيرفر لديه نقاط > 0 — وجود الرصيد وحده يكفي لتفعيل خصم السيرفر."""
     profile = get_guild_profile(guild_id)
-    return bool(profile.get("guild_points_enabled", False)) and int(profile.get("points", 0)) > 0
+    return int(profile.get("points", 0)) > 0
 
 
 def consume_server_point(guild_id):
+    """يخصم نقطة من رصيد السيرفر — يكفي أن يكون الرصيد > 0 (لا يشترط تفعيلًا إضافيًا)."""
     db = _get_db()
     doc = db.guild_profiles.find_one({"guild_id": str(guild_id)}, {"_id": 0}) or {}
     profile = _normalize_guild_profile(doc, guild_id)
-    if not profile.get("guild_points_enabled", False):
-        return False, profile
     if int(profile.get("points", 0)) <= 0:
         return False, profile
     updated = db.guild_profiles.find_one_and_update(
-        {"guild_id": str(guild_id), "points": {"$gt": 0}, "guild_points_enabled": True},
+        {"guild_id": str(guild_id), "points": {"$gt": 0}},
         {"$inc": {"points": -1, "total_extractions": 1}, "$set": {"updated_at": int(time.time())}},
         return_document=True,
         projection={"_id": 0},
@@ -215,10 +214,15 @@ def admin_adjust_server(guild_id, *, points_delta=0, set_points=None, guild_poin
     update = {"$set": {"updated_at": int(time.time())}, "$setOnInsert": {"created_at": int(time.time())}}
     if set_points is not None:
         update["$set"]["points"] = max(0, int(set_points))
+        if int(set_points) > 0:
+            update["$set"]["guild_points_enabled"] = True
     if guild_points_enabled is not None:
         update["$set"]["guild_points_enabled"] = bool(guild_points_enabled)
     if points_delta:
         update["$inc"] = {"points": int(points_delta)}
+        if int(points_delta) > 0:
+            # إضافة نقاط للسيرفر تعني تلقائيًا أن الخصم يصبح من رصيد السيرفر
+            update["$set"]["guild_points_enabled"] = True
     _get_db().guild_profiles.update_one({"guild_id": str(guild_id)}, update, upsert=True)
     return _normalize_guild_profile(
         _get_db().guild_profiles.find_one({"guild_id": str(guild_id)}, {"_id": 0}) or {},

@@ -1,6 +1,7 @@
 import json
 import re
 import base64
+import hashlib
 import time
 from pathlib import Path
 from typing import Any
@@ -76,6 +77,9 @@ class EmojiManager:
         ordered = {"__color__": self.theme}
         if self.application_id:
             ordered["__application_id__"] = self.application_id
+        # حفظ المفاتيح الوصفية الإضافية (مثل __asset_hash__) لتفادي إعادة الرفع في كل تشغيل
+        for key in sorted(k for k in self.map if k.startswith("__") and k not in {"__color__", "__application_id__"}):
+            ordered[key] = self.map.get(key, "")
         for key in sorted(k for k in self.map if not k.startswith("__")):
             ordered[key] = self.map.get(key, "")
         EMOJIS_JSON.parent.mkdir(parents=True, exist_ok=True)
@@ -141,31 +145,99 @@ class EmojiManager:
     def validate_value(self, value):
         return bool(isinstance(value, str) and (CUSTOM_RE.match(value.strip()) or value.strip()))
 
+    def asset_source_dir(self):
+        """مجلد أصول الإيموجي — النسخة الذهبية أولًا لأنها هوية البوت."""
+        gold_dir = ASSETS_DIR / "gold"
+        if gold_dir.exists():
+            try:
+                if any(p.suffix.lower() in {".png", ".gif"} for p in gold_dir.iterdir()):
+                    return gold_dir
+            except OSError:
+                pass
+        return ASSETS_DIR
+
+    @staticmethod
+    def _hash_assets(directory):
+        hasher = hashlib.sha256()
+        for path in sorted(directory.iterdir()):
+            if path.suffix.lower() not in {".png", ".gif"}:
+                continue
+            hasher.update(path.stem.encode("utf-8"))
+            hasher.update(path.read_bytes())
+        return hasher.hexdigest()
+
     def sync_application_emojis(self, bot_user_id: int, token: str):
+        """
+        يرفع/يحدّث إيموجيات التطبيق من أصول النسخة الذهبية (assets/emojis/gold).
+        - إن كان الإيموجي موجودًا بصورة قديمة (مثل النسخة البنفسجية السابقة) يتم تحديث صورته.
+        - تخزين __asset_hash__ يجعل التشغيلات التالية تخطي المزامنة بالكامل بدون أي اتصال بالـ API.
+        """
         if not token:
             raise RuntimeError("DISCORD_TOKEN is required to sync application emojis.")
-        if not ASSETS_DIR.exists():
-            raise RuntimeError(f"Emoji assets directory not found: {ASSETS_DIR}")
+        source_dir = self.asset_source_dir()
+        if not source_dir.exists():
+            raise RuntimeError(f"Emoji assets directory not found: {source_dir}")
+        asset_hash = self._hash_assets(source_dir)
+        self.application_id = str(bot_user_id)
+
+        # مسار سريع — لا اتصال بالـ API إذا كانت النسخة المحلية مطابقة تمامًا لهذه الأصول
+        local = self._load_json(EMOJIS_JSON)
+        if (
+            str(local.get("__application_id__", "")) == self.application_id
+            and local.get("__asset_hash__") == asset_hash
+            and any(not k.startswith("__") for k in local)
+        ):
+            self.map = local
+            return {"ok": True, "skipped": True, "uploaded": 0, "updated": 0,
+                    "mapped": len([k for k in local if not k.startswith("__")]),
+                    "theme": "gold", "source": str(source_dir)}
+
         headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
         api = f"https://discord.com/api/v10/applications/{bot_user_id}/emojis"
         current = requests.get(api, headers=headers, timeout=30)
         current.raise_for_status()
         items = current.json()
         existing = {item["name"]: item for item in (items if isinstance(items, list) else items.get("items", []))}
-        self.application_id = str(bot_user_id)
         theme = "gold"
         prefix = THEMES[theme]["prefix"]
-        fresh = {"__color__": theme, "__application_id__": self.application_id}
+        fresh = {"__color__": theme, "__application_id__": self.application_id, "__asset_hash__": asset_hash}
         uploaded = 0
-        for path in sorted(ASSETS_DIR.iterdir()):
+        updated = 0
+        for path in sorted(source_dir.iterdir()):
             if path.suffix.lower() not in {".png", ".gif"}:
                 continue
             base_name = path.stem
             discord_name = f"{prefix}_{base_name}"
+            mime = "image/gif" if path.suffix.lower() == ".gif" else "image/png"
+            image_uri = f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
             item = existing.get(discord_name)
+            if item is not None:
+                # حدّث صورة الإيموجي الموجود إلى النسخة الذهبية (مثل تحويل البنفسجي القديم)
+                patched = None
+                for attempt in range(3):
+                    try:
+                        patched = requests.patch(f"{api}/{item['id']}", headers=headers, json={"image": image_uri}, timeout=30)
+                        if patched.status_code == 429:
+                            retry_after = float(patched.json().get("retry_after", 2.0) or 2.0)
+                            time.sleep(min(retry_after, 10.0))
+                            patched = None
+                            continue
+                        break
+                    except requests.RequestException:
+                        time.sleep(1.5 * (attempt + 1))
+                if patched is not None and patched.ok:
+                    item = patched.json()
+                    existing[discord_name] = item
+                    updated += 1
+                else:
+                    # بديل احتياطي — حذف وإعادة إنشاء بنفس الاسم
+                    try:
+                        requests.delete(f"{api}/{item['id']}", headers=headers, timeout=30)
+                    except requests.RequestException:
+                        pass
+                    item = None
             if item is None:
-                mime = "image/gif" if path.suffix.lower() == ".gif" else "image/png"
-                payload = {"name": discord_name, "image": f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"}
+                payload = {"name": discord_name, "image": image_uri}
                 created = None
                 last_error = None
                 for attempt in range(3):
@@ -191,7 +263,9 @@ class EmojiManager:
             fresh[base_name] = f"<{'a' if animated else ''}:{item['name']}:{item['id']}>"
         self.map = fresh
         self.save()
-        return {"ok": True, "uploaded": uploaded, "mapped": len([k for k in fresh if not k.startswith("__")]), "theme": theme, "source": str(ASSETS_DIR)}
+        return {"ok": True, "uploaded": uploaded, "updated": updated,
+                "mapped": len([k for k in fresh if not k.startswith("__")]),
+                "theme": theme, "source": str(source_dir)}
 
 emoji_manager = EmojiManager()
 
