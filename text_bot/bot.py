@@ -33,14 +33,30 @@ BOT_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "656783724662226963"))
 TEMP_API_URL = os.getenv("TEMP_API_URL", "").rstrip("/")
 BASE_QWEN_URL = os.getenv("BASE_QWEN_URL", "https://chat.qwen.ai/api/v2").rstrip("/")
-BOT_VERSION = os.getenv("BOT_VERSION", "2.2.0")
+BOT_VERSION = os.getenv("BOT_VERSION", "2.3.0")
 GDRIVE_API_KEY = os.getenv("GDRIVE_API_KEY", "").strip()
 
-MAX_IMAGES_PER_REQUEST = int(os.getenv("MAX_IMAGES_PER_REQUEST", "5"))
+MAX_IMAGES_PER_REQUEST = int(os.getenv("MAX_IMAGES_PER_REQUEST", "10"))
 MAX_IMAGE_SIZE_MB = int(os.getenv("MAX_IMAGE_SIZE_MB", "8"))
 
 # عدد المحاولات لكل صورة عند الفشل
 MAX_RETRY_PER_IMAGE = int(os.getenv("MAX_RETRY_PER_IMAGE", "3"))
+
+# المعالجة المتوازية — عدد الصفحات التي تُعالج في نفس اللحظة
+EXTRACTION_CONCURRENCY = max(1, int(os.getenv("EXTRACTION_CONCURRENCY", "2")))
+
+# التقسيم الذكي للصور الشريطية الطويلة (فصول المانهوا المدموجة عموديًا)
+# الصور الأطول من TILE_MAX_EDGE تُعامل كشريط طويل، وتُقطع إلى أجزاء بارتفاع TILE_HEIGHT
+# مع تداخل TILE_OVERLAP حتى لا تنقطع فقاعة حوار عند الحدود.
+TILE_MAX_EDGE = int(os.getenv("TILE_MAX_EDGE", "6000"))
+TILE_HEIGHT = int(os.getenv("TILE_HEIGHT", "3200"))
+TILE_OVERLAP = int(os.getenv("TILE_OVERLAP", "320"))
+TILE_MIN_TAIL = int(os.getenv("TILE_MIN_TAIL", "900"))
+TILE_MAX_RETRIES = int(os.getenv("TILE_MAX_RETRIES", "2"))
+
+# الترجمة المجزأة — الفصول الطويلة تُترجم على مجموعات حتى لا ينقطع الناتج
+TRANSLATION_CHUNK_LINES = int(os.getenv("TRANSLATION_CHUNK_LINES", "60"))
+TRANSLATION_CHUNK_CHARS = int(os.getenv("TRANSLATION_CHUNK_CHARS", "9000"))
 
 from utils.storage import (
     admin_adjust_user,
@@ -301,7 +317,7 @@ async def deliver_extraction_result(channel, user_id, *, combined_text, translat
     if failed_pages:
         failed_note = "تعذّرت قراءة صفحة واحدة" if len(failed_pages) == 1 else f"تعذّرت قراءة `{len(failed_pages)}` صفحة"
         failed_names = ", ".join(f"`{name}`" for name in failed_pages[:5])
-        extra_line = f"{failed_note} حتى بعد إعادة المحاولة تلقائيًا: {failed_names} — أعد استخراج هذه الصفحات إن أردت"
+        extra_line = f"{failed_note} حتى بعد إعادة المحاولة والتقسيم الذكي: {failed_names} — أعد استخراج هذه الصفحات إن أردت"
         warning = f"{warning}\n{extra_line}" if warning else extra_line
 
     translation_info = None
@@ -452,22 +468,38 @@ async def deliver_translation_result(channel, user_id, *, translated_text, targe
 
 
 async def run_translation_with_status(status_msg, channel, user_id, guild_id, chapter_text,
-                                      source_stem, target, output_format):
-    """المنطق المشترك لترجمة فصل جاهز — يُستخدم في /translate و !translate."""
+                                      source_stem, target, output_format, *, thinking_enabled=False):
+    """المنطق المشترك لترجمة فصل جاهز — يُستخدم في /translate و !ترجمة مع دعم وضعي المعالجة."""
     target_label = TRANSLATION_TARGETS.get(target, TRANSLATION_TARGETS["ar"])
     lines_count = len([ln for ln in chapter_text.splitlines() if ln.strip()])
+    mode_label = "دقة كاملة" if thinking_enabled else "سرعة عالية"
     await edit_status(
         status_msg,
         "جاري الترجمة الأدبية",
-        f"لغة الترجمة: `{target_label}` — المعالجة نصية فقط وقد تطول قليلاً حسب طول الفصل.",
+        f"الوضع: `{mode_label}` — لغة الترجمة: `{target_label}` — الأسطر: `{lines_count}`.",
     )
     started_at = time.monotonic()
+    loop = asyncio.get_running_loop()
+
+    def progress_cb(part, total):
+        if total > 1:
+            asyncio.run_coroutine_threadsafe(
+                edit_status(
+                    status_msg,
+                    "جاري الترجمة الأدبية",
+                    f"الوضع: `{mode_label}` — الجزء `{part}` من `{total}` — لغة الترجمة: `{target_label}`.",
+                ),
+                loop,
+            )
+
     try:
         translated = await asyncio.to_thread(
             translate_chapter_text,
             user_id,
             chapter_text,
             {"translate_target": target},
+            thinking_enabled=thinking_enabled,
+            progress_cb=progress_cb,
         )
     except Exception as exc:
         await edit_status(status_msg, "{emoji:circlex} فشلت الترجمة", str(exc), error=True)
@@ -736,10 +768,10 @@ def _strip_code_fences(text):
     return text.strip()
 
 
-def request_qwen_text_completion(user_id, prompt, *, service_type="chat", max_attempts=3):
+def request_qwen_text_completion(user_id, prompt, *, service_type="chat", max_attempts=3, thinking_enabled=False):
     """
-    طلب محادثة نصي فقط (بدون أي صور) إلى Qwen مع إعادة محاولات محدودة.
-    يُستخدم لمرحلة الترجمة الأدبية بعد انتهاء الاستخراج.
+    طلب محادثة نصي فقط (بدون أي صور) إلى المزوّد مع إعادة محاولات محدودة.
+    يُستخدم لمرحلة الترجمة الأدبية — وضع الدقة الكاملة يفعّل المعالجة الأعمق.
     """
     last_error = None
     for attempt in range(1, max_attempts + 1):
@@ -756,9 +788,9 @@ def request_qwen_text_completion(user_id, prompt, *, service_type="chat", max_at
                 "role": "user",
                 "feature_config": {
                     "output_schema": "phase",
-                    "thinking_enabled": False,
+                    "thinking_enabled": bool(thinking_enabled),
                     "thinking_format": "summary",
-                    "auto_thinking": False,
+                    "auto_thinking": bool(thinking_enabled),
                     "auto_search": False,
                 },
                 "timestamp": int(time.time()),
@@ -809,12 +841,12 @@ def request_qwen_text_completion(user_id, prompt, *, service_type="chat", max_at
 
             if rate_limited:
                 mark_account_rate_limited(user_id, service_type)
-                last_error = Exception("تعذّرت الترجمة حالياً بسبب ضغط على الخدمة — حاول بعد قليل.")
+                last_error = Exception("ضغط مؤقت على محرك المعالجة — سيُعاد المحاولة.")
                 time.sleep(2 * attempt)
                 continue
 
-            cleaned = _strip_code_fences(_sanitize_extraction(full_response))
-            if cleaned and cleaned != _EXTRACTION_FAILED_MARKER:
+            cleaned = _sanitize_translation(full_response)
+            if cleaned:
                 return cleaned
             last_error = Exception("تعذّر الحصول على ترجمة صالحة — حاول مرة أخرى.")
         except Exception as exc:
@@ -822,17 +854,118 @@ def request_qwen_text_completion(user_id, prompt, *, service_type="chat", max_at
             time.sleep(2 * attempt)
     raise last_error or Exception("فشلت الترجمة بعد عدة محاولات.")
 
+def _sanitize_translation(text):
+    """
+    تنظيف خاص بمخرجات الترجمة — بدون فحص الضجيج حتى لا تُرفض
+    ترجمات مشروعة تحتوي عبارات إنجليزية شائعة (مثل Unfortunately...).
+    """
+    cleaned = _strip_code_fences(text)
+    cleaned = re.sub(r"===\s*CHAPTER TEXT (START|END)\s*===", "", cleaned)
+    return cleaned.strip()
 
-def translate_chapter_text(user_id, chapter_text, settings):
-    """يترجم نص الفصل المستخرج أدبياً في مرحلة ثانية نصية فقط بدون صور."""
+
+def _split_translation_chunks(chapter_text, max_lines=None, max_chars=None):
+    """
+    يقسم نص الفصل إلى مجموعات ترجمة متوازنة:
+    - حدود المجموعات عند فواصل الصفحات (## name) كلما أمكن فلا ينقطع سياق صفحة.
+    - كل مجموعة تحت سقف أسطر/أحرف حتى لا ينقطع الناتج عند المزوّد.
+    """
+    max_lines = max_lines or TRANSLATION_CHUNK_LINES
+    max_chars = max_chars or TRANSLATION_CHUNK_CHARS
+    text = (chapter_text or "").strip()
+    if not text:
+        return []
+    lines = text.split("\n")
+
+    # تجميع السطور في كتل — كل فاصل صفحة يبدأ كتلة جديدة
+    blocks = []
+    current = []
+    for ln in lines:
+        if ln.strip().startswith("## ") and current:
+            blocks.append(current)
+            current = [ln]
+        else:
+            current.append(ln)
+    if current:
+        blocks.append(current)
+
+    def weight(blk):
+        return sum(1 for l in blk if l.strip()), sum(len(l) for l in blk)
+
+    chunks = []
+    cur, cur_cnt, cur_len = [], 0, 0
+    for blk in blocks:
+        cnt, length = weight(blk)
+        if cur and (cur_cnt + cnt > max_lines or cur_len + length > max_chars):
+            chunks.append("\n".join(cur).strip("\n"))
+            cur, cur_cnt, cur_len = [], 0, 0
+        cur.extend(blk)
+        cur_cnt += cnt
+        cur_len += length
+    if cur:
+        chunks.append("\n".join(cur).strip("\n"))
+
+    # كتلة واحدة ضخمة بلا فواصل؟ تُشطر بالأسطر مباشرة
+    final_chunks = []
+    for chunk in chunks:
+        chunk_lines = chunk.split("\n")
+        cnt = sum(1 for l in chunk_lines if l.strip())
+        if cnt <= max_lines and len(chunk) <= max_chars:
+            final_chunks.append(chunk)
+            continue
+        cur, cur_cnt, cur_len = [], 0, 0
+        for ln in chunk_lines:
+            if ln.strip() and cur and (cur_cnt + 1 > max_lines or cur_len + len(ln) > max_chars):
+                final_chunks.append("\n".join(cur).strip("\n"))
+                cur, cur_cnt, cur_len = [], 0, 0
+            cur.append(ln)
+            if ln.strip():
+                cur_cnt += 1
+            cur_len += len(ln)
+        if cur:
+            final_chunks.append("\n".join(cur).strip("\n"))
+    return [c for c in final_chunks if c.strip()]
+
+
+def translate_chapter_text(user_id, chapter_text, settings, *, thinking_enabled=False, progress_cb=None):
+    """
+    يترجم نص الفصل أدبيًا في مرحلة نصية فقط بدون صور.
+    الفصول الطويلة تُقسم تلقائيًا إلى مجموعات مترجمة بالتتابع
+    (مع تقدم حي عبر progress_cb) حتى لا ينقطع الناتج،
+    ووضع الدقة الكاملة يفعّل المعالجة الأعمق لكل مجموعة.
+    """
     target = (settings or {}).get("translate_target", "ar")
-    prompt = (
-        build_translation_prompt(target)
-        + "\n\n=== CHAPTER TEXT START ===\n"
-        + chapter_text.strip()
-        + "\n=== CHAPTER TEXT END ==="
-    )
-    return request_qwen_text_completion(user_id, prompt)
+    chunks = _split_translation_chunks(chapter_text)
+    if not chunks:
+        raise Exception("لا يوجد نص لترجمته.")
+    total = len(chunks)
+    outputs = []
+    for i, chunk in enumerate(chunks, start=1):
+        if progress_cb:
+            try:
+                progress_cb(i, total)
+            except Exception:
+                pass
+        part_note = (
+            f"\n\n(This is part {i} of {total} of the same chapter. Translate this part only, "
+            "continuing naturally from the previous part, with no preamble.)"
+            if total > 1 else ""
+        )
+        prompt = (
+            build_translation_prompt(target)
+            + part_note
+            + "\n\n=== CHAPTER TEXT START ===\n"
+            + chunk
+            + "\n=== CHAPTER TEXT END ==="
+        )
+        part = request_qwen_text_completion(
+            user_id, prompt, service_type="chat", thinking_enabled=thinking_enabled,
+        )
+        cleaned = _sanitize_translation(part)
+        if not cleaned:
+            raise Exception(f"جاءت ترجمة الجزء {i} فارغة — حاول مرة أخرى.")
+        outputs.append(cleaned)
+    return "\n\n".join(outputs) if total > 1 else outputs[0]
 
 
 # ============================================================
@@ -1077,7 +1210,7 @@ def generate_oss_signature(secret_key, method, content_md5, content_type, date, 
     h = hmac.new(secret_key.encode('utf-8'), string_to_sign.encode('utf-8'), hashlib.sha1)
     return base64.b64encode(h.digest()).decode('utf-8')
 
-def upload_image_to_qwen_oss(user_id, photo_bytes, service_type="chat"):
+def upload_image_to_qwen_oss(user_id, photo_bytes, service_type="chat", _attempt=1):
     file_size = str(len(photo_bytes))
     filename = f"{uuid.uuid4()}_IMG.jpg"
     sts_url = "https://chat.qwen.ai/api/v2/files/getstsToken"
@@ -1089,7 +1222,11 @@ def upload_image_to_qwen_oss(user_id, photo_bytes, service_type="chat"):
     res = session.post(sts_url, json=payload, timeout=60).json()
     if is_rate_limited_response(res):
         mark_account_rate_limited(user_id, service_type)
-        return upload_image_to_qwen_oss(user_id, photo_bytes, service_type)
+        # حد أقصى للمحاولات — تدوير الحسابات قد يُنشئ حسابات جديدة، فلا نسمح بحلقة مفتوحة
+        if _attempt >= 3:
+            raise Exception("تعذّر رفع الصورة إلى محرك المعالجة بسبب ضغط مؤقت.")
+        time.sleep(2 * _attempt)
+        return upload_image_to_qwen_oss(user_id, photo_bytes, service_type, _attempt + 1)
     if "data" not in res:
         raise Exception(f"فشل تصريح الرفع:\n{json.dumps(res, ensure_ascii=False)}")
     sts_res = res["data"]
@@ -1162,7 +1299,7 @@ def upload_image_to_qwen_oss(user_id, photo_bytes, service_type="chat"):
         "url": signed_url,
     }
 
-def create_new_chat(user_id, service_type="chat"):
+def create_new_chat(user_id, service_type="chat", _attempt=1):
     url = "https://chat.qwen.ai/api/v2/chats/new"
     payload = {"chat_mode": "normal", "project_id": ""}
     headers = get_qwen_headers(user_id, service_type)
@@ -1170,12 +1307,15 @@ def create_new_chat(user_id, service_type="chat"):
     res = requests.post(url, json=payload, headers=headers, timeout=60).json()
     if is_rate_limited_response(res):
         mark_account_rate_limited(user_id, service_type)
-        return create_new_chat(user_id, service_type)
+        if _attempt >= 3:
+            raise Exception("تعذّر بدء جلسة معالجة جديدة بسبب ضغط مؤقت.")
+        time.sleep(2 * _attempt)
+        return create_new_chat(user_id, service_type, _attempt + 1)
     if "data" not in res:
         raise Exception(f"فشل إنشاء المحادثة:\n{json.dumps(res, ensure_ascii=False)}")
     return res["data"]["id"]
 
-def delete_chat(user_id, chat_id, service_type="chat"):
+def delete_chat(user_id, chat_id, service_type="chat", timeout=10):
     if not chat_id:
         return False
     url = f"https://chat.qwen.ai/api/v2/chats/{chat_id}"
@@ -1183,7 +1323,7 @@ def delete_chat(user_id, chat_id, service_type="chat"):
     headers['x-request-id'] = str(uuid.uuid4())
     headers['Content-Type'] = "application/x-www-form-urlencoded"
     try:
-        r = requests.delete(url, headers=headers, timeout=30)
+        r = requests.delete(url, headers=headers, timeout=timeout)
         return r.status_code in [200, 204]
     except Exception:
         return False
@@ -1270,7 +1410,7 @@ def get_image_dimensions(image_bytes):
 def _do_single_extraction(user_id, image_bytes, image_name, thinking_enabled, settings, chat_id, retry_hint=False):
     """
     الدالة الأساسية لطلب واحد إلى المزوّد.
-    تُعيد النص الخام أو ترفع استثناءً.
+    تُعيد (النص الخام، معرف المحادثة المستخدمة) أو ترفع استثناءً عند أي فشل.
     retry_hint=True يضيف تعليمات تدقيق أعمق (تُستخدم في محاولات الإعادة فقط).
     """
     uploaded = upload_image_to_qwen_oss(user_id, image_bytes, "ocr")
@@ -1332,15 +1472,26 @@ def _do_single_extraction(user_id, image_bytes, image_name, thinking_enabled, se
     }
 
     response = requests.post(url, json=payload, headers=headers, stream=True, timeout=300)
+    if response.status_code != 200:
+        body = ""
+        try:
+            body = response.text[:300]
+        except Exception:
+            pass
+        if is_rate_limited_response(body):
+            mark_account_rate_limited(user_id, "ocr")
+            raise Exception("ضغط مؤقت على محرك المعالجة — سيُعاد المحاولة تلقائيًا.")
+        raise Exception(f"فشل الاتصال بمحرك المعالجة (HTTP {response.status_code}).")
+
     full_response = ""
+    rate_limited = False
     for line in response.iter_lines():
         if not line:
             continue
         line_str = line.decode('utf-8')
         if is_rate_limited_response(line_str):
-            mark_account_rate_limited(user_id, "ocr")
-            new_chat_id = create_new_chat(user_id, "ocr")
-            return _do_single_extraction(user_id, image_bytes, image_name, thinking_enabled, settings, new_chat_id)
+            rate_limited = True
+            break
         if line_str.startswith("data: "):
             data_content = line_str[6:].strip()
             if data_content == "[DONE]":
@@ -1348,9 +1499,8 @@ def _do_single_extraction(user_id, image_bytes, image_name, thinking_enabled, se
             try:
                 data_json = json.loads(data_content)
                 if is_rate_limited_response(data_json):
-                    mark_account_rate_limited(user_id, "ocr")
-                    new_chat_id = create_new_chat(user_id, "ocr")
-                    return _do_single_extraction(user_id, image_bytes, image_name, thinking_enabled, settings, new_chat_id)
+                    rate_limited = True
+                    break
                 if "choices" in data_json and len(data_json["choices"]) > 0:
                     delta = data_json["choices"][0].get("delta", {})
                     if delta.get("phase") == "answer" and delta.get("content"):
@@ -1358,43 +1508,187 @@ def _do_single_extraction(user_id, image_bytes, image_name, thinking_enabled, se
             except Exception:
                 continue
 
-    return full_response.strip()
+    if rate_limited:
+        mark_account_rate_limited(user_id, "ocr")
+        raise Exception("ضغط مؤقت على محرك المعالجة — سيُعاد المحاولة تلقائيًا.")
+
+    # الرد الفارغ يعني فشلًا فعليًا (انقطاع/خطأ غير معلن) وليس صورة بلا نص —
+    # رفعه كاستثناء يجعل نظام المحاولات يعمل بدلاً من قبول صفحة فارغة بصمت.
+    if not full_response.strip():
+        raise Exception("استجابة فارغة من محرك المعالجة — سيُعاد المحاولة.")
+
+    return full_response.strip(), chat_id
+
+
+def _delete_chat_quiet(user_id, chat_id):
+    """حذف المحادثة المؤقتة بعد انتهاء الصفحة — نظافة حساب بلا أي تأثير على النتيجة."""
+    if not chat_id:
+        return
+    try:
+        delete_chat(user_id, chat_id, "ocr")
+    except Exception:
+        pass
+
+
+def split_long_image(image_bytes):
+    """
+    يقسم الصور الشريطية الطويلة (فصول مانهوا مدموجة عموديًا) إلى أجزاء قابلة للقراءة.
+    الصورة الأصلية بهذا الارتفاع تُضغط بشدة عند المزوّد فتفقد النص قابلية القراءة —
+    التقسيم يعيد لكل جزء دقته الكاملة.
+    يعيد قائمة (bytes, label) — بعنصر واحد إذا كانت الصورة عادية لا تحتاج تقسيمًا.
+    """
+    img = Image.open(io.BytesIO(image_bytes))
+    img.load()
+    w, h = img.size
+    if h <= TILE_MAX_EDGE:
+        return [(image_bytes, "full")]
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    tiles = []
+    overlap = min(TILE_OVERLAP, max(0, TILE_HEIGHT // 4))
+    top = 0
+    part_no = 1
+    while top < h:
+        bottom = min(top + TILE_HEIGHT, h)
+        # ذيل صغير جدًا؟ ادمجه مع الجزء الأخير بدل جزء شبه فارغ
+        if h - bottom < TILE_MIN_TAIL:
+            bottom = h
+        crop = img.crop((0, top, w, bottom))
+        buf = io.BytesIO()
+        crop.save(buf, format="JPEG", quality=92)
+        tiles.append((buf.getvalue(), f"part{part_no}"))
+        if bottom >= h:
+            break
+        top = bottom - overlap if bottom - overlap > top else bottom
+        part_no += 1
+    return tiles
+
+
+def _merge_tile_texts(parts):
+    """
+    يدمج نصوص أجزاء الصورة الواحدة مع إزالة التكرار الناتج عن مناطق التداخل:
+    السطور الأولى لكل جزء التي تكرر نهاية الجزء السابق تُتجاهل.
+    """
+    def norm(s):
+        return re.sub(r"\s+", "", s or "").lower()
+
+    merged = []
+    for part in parts:
+        lines = (part or "").splitlines()
+        start = 0
+        if merged:
+            tail_norms = {norm(ln) for ln in merged[-14:] if ln.strip()}
+            while start < len(lines):
+                line_norm = norm(lines[start])
+                if not line_norm or line_norm not in tail_norms:
+                    break
+                start += 1
+        new_lines = lines[start:]
+        if not new_lines:
+            continue
+        # فاصل بصري خفيف بين حدود الأجزاء حتى لا يلتصق حواران
+        if merged and merged[-1].strip() and new_lines[0].strip():
+            merged.append("")
+        merged.extend(new_lines)
+    return "\n".join(merged).strip()
+
+
+def _extract_tiled(user_id, tiles, thinking_enabled, settings):
+    """
+    يستخرج نص كل جزء من أجزاء الصورة المقطوعة ثم يدمجها.
+    يرفع استثناءً إذا فشل أي جزء فشلاً تقنيًا (ليُعاد للصفحة في مرحلة الإنقاذ).
+    الجزء الذي يجيب المزوّد فيه (No) يُقبل كمنطقة فارغة بعد محاولة تدقيق واحدة.
+    """
+    texts = []
+    last_error = None
+    for tile_bytes, tile_label in tiles:
+        accepted = False
+        for attempt in range(1, TILE_MAX_RETRIES + 1):
+            chat_id = None
+            try:
+                raw, chat_id = _do_single_extraction(
+                    user_id, tile_bytes, tile_label, thinking_enabled, settings, None,
+                    retry_hint=attempt >= 2,
+                )
+                cleaned = _sanitize_extraction(raw)
+                if cleaned == _EXTRACTION_FAILED_MARKER:
+                    # جزء بلا نص فعلاً (بعد تدقيق الإعادة) — منطقة فارغة مشروعة
+                    texts.append("")
+                    accepted = True
+                    break
+                texts.append(cleaned)
+                accepted = True
+                break
+            except Exception as exc:
+                last_error = exc
+                time.sleep(2 * attempt)
+            finally:
+                _delete_chat_quiet(user_id, chat_id)
+        if not accepted:
+            raise last_error or Exception(f"تعذّرت قراءة جزء من الصورة ({tile_label}).")
+    return _merge_tile_texts(texts)
 
 
 def extract_text_from_single_image(user_id, image_bytes, image_name, thinking_enabled, settings=None, chat_id=None):
     """
-    يستخرج النص من صورة واحدة مع إعادة المحاولة عند الفشل.
-    - يُعيد النص المستخرج عند النجاح
-    - يُعيد "" عند الفشل الكامل بعد كل المحاولات (صورة فارغة حقيقية أو فشل شبكة)
+    استخراج كامل الدورة لصورة واحدة:
+    1) محاولات على الصورة كاملة.
+    2) الصور الشريطية الطويلة: في وضع الدقة الكاملة تُقطع فورًا، وفي وضع السرعة
+       يُقطعون كخطة بديلة فقط عند فشل الصورة كاملة أو إعلان (No) عليها.
+    3) الفشل التقني الحقيقي يرفع استثناءً ليستلمه خط الأنابيب في مرحلة الإنقاذ.
     """
+    chat_id_used = None
     last_error = None
-    for attempt in range(1, MAX_RETRY_PER_IMAGE + 1):
+
+    # وضع الدقة الكاملة مع شريط طويل → التقسيم مباشرة هو الخيار الأدق
+    if thinking_enabled:
         try:
-            raw = _do_single_extraction(user_id, image_bytes, image_name, thinking_enabled, settings, chat_id, retry_hint=attempt >= 2)
+            tiles = split_long_image(image_bytes)
+        except Exception:
+            tiles = []
+        if len(tiles) > 1:
+            merged = _extract_tiled(user_id, tiles, thinking_enabled, settings)
+            if merged.strip():
+                return merged
+            return ""
+    else:
+        tiles = None
+
+    for attempt in range(1, MAX_RETRY_PER_IMAGE + 1):
+        chat_id_used = None
+        try:
+            raw, chat_id_used = _do_single_extraction(
+                user_id, image_bytes, image_name, thinking_enabled, settings, chat_id,
+                retry_hint=attempt >= 2,
+            )
             cleaned = _sanitize_extraction(raw)
+            if cleaned != _EXTRACTION_FAILED_MARKER:
+                return cleaned
+            last_error = None  # إعلان (No) موثّق — ليس خطأ تقنيًا
+        except Exception as exc:
+            last_error = exc
+        finally:
+            _delete_chat_quiet(user_id, chat_id_used)
+        if attempt < MAX_RETRY_PER_IMAGE:
+            time.sleep(2 * attempt)
+            chat_id = None
 
-            # إذا كان الرد هو رسالة الفشل الموحدة → أعد المحاولة
-            if cleaned == _EXTRACTION_FAILED_MARKER:
-                if attempt < MAX_RETRY_PER_IMAGE:
-                    time.sleep(2 * attempt)  # انتظار تصاعدي بين المحاولات
-                    chat_id = None  # محادثة جديدة في المحاولة التالية
-                    continue
-                # استنفدنا المحاولات والصورة فارغة فعلاً
-                return ""
+    # خطة التقسيم الذكي — الشريط الطويل الذي فشل كاملًا أو أُعلن (No) عليه
+    if tiles is None:
+        try:
+            tiles = split_long_image(image_bytes)
+        except Exception:
+            tiles = []
+    if len(tiles) > 1:
+        merged = _extract_tiled(user_id, tiles, True, settings)
+        if merged.strip():
+            return merged
+        # حتى مع التقسيم: لا نص إطلاقًا — صورة فارغة مؤكدة
+        return ""
 
-            # رد سليم
-            return cleaned
-
-        except Exception as e:
-            last_error = e
-            if attempt < MAX_RETRY_PER_IMAGE:
-                time.sleep(3 * attempt)
-                chat_id = None
-                continue
-
-    # فشل كامل بعد كل المحاولات
-    print(f"[extract] فشل نهائي للصورة '{image_name}' بعد {MAX_RETRY_PER_IMAGE} محاولات: {last_error}")
-    raise last_error or Exception(f"فشل استخراج الصورة '{image_name}' بعد {MAX_RETRY_PER_IMAGE} محاولات.")
+    if last_error is not None:
+        raise last_error
+    return ""
 
 
 # ============================================================
@@ -1477,6 +1771,20 @@ def read_upload_chapter_text(filename: str, data: bytes) -> str:
     return text
 
 
+def ensure_valid_image(data: bytes, source_label: str = "") -> bytes:
+    """
+    يتأكد أن البيانات صورة حقيقية قابلة للفك — يرفض صفحات الخطأ HTML
+    أو الملفات التالفة مبكرًا برسالة واضحة بدل فشل غامض في مرحلة الاستخراج.
+    """
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.load()
+        return data
+    except Exception as exc:
+        label = f" (`{source_label}`)" if source_label else ""
+        raise Exception(f"المصدر{label} ليس صورة صالحة — قد يكون التحميل أعاد صفحة خطأ بدلاً منه، أعد المحاولة.") from exc
+
+
 def extract_gdrive_folder_id(url):
     patterns = [
         r'/folders/([a-zA-Z0-9_-]+)',
@@ -1511,8 +1819,19 @@ def get_drive_item_name(item_id):
     return "zeus"
 
 def list_drive_images(folder_id):
+    """
+    يجلب صور المجلد مع شبكة أمان إضافية:
+    - mimeType يحتوي image/ أو الاسم بامتداد صورة (بعض الملفات تُخزن بميم خاطئ فتُحذف من القائمة)
+    - استبعاد عناصر Google Docs/Sheets والمحذوفة
+    """
     url = "https://www.googleapis.com/drive/v3/files"
-    query = f"'{folder_id}' in parents and mimeType contains 'image/'"
+    name_match = " or ".join(
+        [f"name contains '{ext}'" for ext in (".jpg", ".jpeg", ".png", ".webp", ".bmp")]
+    )
+    query = (
+        f"'{folder_id}' in parents and trashed = false "
+        f"and (mimeType contains 'image/' or {name_match})"
+    )
     params = {
         "q": query,
         "key": GDRIVE_API_KEY,
@@ -1523,8 +1842,11 @@ def list_drive_images(folder_id):
     r = requests.get(url, params=params, timeout=60)
     if r.status_code != 200:
         raise Exception(f"فشل جلب قائمة الصور: {r.status_code} - {r.text[:200]}")
-    files = r.json().get("files", [])
-    files.sort(key=lambda x: natural_sort_key(x["name"]))
+    files = [
+        f for f in r.json().get("files", [])
+        if not str(f.get("mimeType", "")).startswith("application/vnd.google-apps")
+    ]
+    files.sort(key=lambda x: natural_sort_key(x.get("name", "")))
     return files
 
 def download_drive_image(file_id):
@@ -1545,8 +1867,17 @@ def process_drive_link(link, *, include_name=False):
         files = list_drive_images(folder_id)
         images = []
         for f in files:
-            data = download_drive_image(f["id"])
-            images.append((data, f["name"]))
+            name = f.get("name", "")
+            mime = str(f.get("mimeType", ""))
+            if not (
+                mime.startswith("image/")
+                or name.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp"))
+            ):
+                continue
+            data = ensure_valid_image(download_drive_image(f["id"]), name)
+            images.append((data, name))
+        if not images:
+            raise Exception("المجلد لا يحتوي صورًا صالحة.")
         source_name = get_drive_item_name(folder_id)
         return (images, source_name) if include_name else images
     elif file_id:
@@ -1562,11 +1893,19 @@ def process_drive_link(link, *, include_name=False):
 
 def extract_images_from_zip_bytes(zip_bytes):
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-        image_names = [name for name in zf.namelist() if name.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))]
+        image_names = [
+            name for name in zf.namelist()
+            if name.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp"))
+            and not name.startswith("__MACOSX")
+        ]
         image_names.sort(key=lambda x: natural_sort_key(os.path.basename(x)))
         images = []
         for name in image_names:
             data = zf.read(name)
+            try:
+                data = ensure_valid_image(data, os.path.basename(name))
+            except Exception:
+                continue  # ملف تالف داخل الأرشيف — تجاوزه ولا تُفشّل الفصل كله
             images.append((data, os.path.basename(name)))
         return images
 
@@ -1594,47 +1933,61 @@ async def resolve_and_consume_point(user_id: int, guild_id) -> tuple:
 # ============================================================
 async def run_extraction_pipeline(status_msg, user_id, images, thinking_enabled, settings):
     """
-    يستخرج نص كل صفحة مع نظام محاولات قوي:
-    - كل صفحة تحصل على محاولات داخلية كاملة (MAX_RETRY_PER_IMAGE).
+    يستخرج نص كل صفحة مع نظام محاولات قوي ومعالجة متوازية:
+    - كل صفحة تحصل على محاولات داخلية كاملة + تقسيم ذكي للشرائط الطويلة.
+    - عدة صفحات تُعالج في نفس اللحظة (EXTRACTION_CONCURRENCY) لتقصير المدة الكلية.
     - الصفحات التي تفشل فعلياً تُعاد مرة أخيرة بوضع الدقة الكاملة قبل الاستسلام.
     - لا يتوقف الفصل كله بسبب صفحة واحدة فاشلة.
     يعيد: (combined_text, empty_images, failed_page_names)
     """
     total_images = len(images)
     page_texts = {}
+    failed_notices = {}
+    completed = 0
+    progress_lock = asyncio.Lock()
+    semaphore = asyncio.Semaphore(max(1, EXTRACTION_CONCURRENCY))
 
-    for idx, (img_bytes, img_name) in enumerate(images, start=1):
-        try:
-            page_texts[idx] = await asyncio.to_thread(
-                extract_text_from_single_image,
-                user_id,
-                img_bytes,
-                img_name,
-                thinking_enabled,
-                settings,
-            )
-        except Exception as e:
-            page_texts[idx] = None
-            await edit_status(
-                status_msg,
-                "تعذّرت قراءة صفحة",
-                f"الصفحة `{idx}` (`{img_name}`): {str(e)} — سأعيد المحاولة مرة أخرى بعد إكمال باقي الصفحات.",
-            )
-        else:
-            await edit_status(
-                status_msg,
-                "المعالجة مستمرة",
-                f"تمت معالجة الصورة `{idx}` من `{total_images}`.",
-                current=idx,
-                total=total_images,
-            )
+    async def worker(idx: int, img_bytes: bytes, img_name: str):
+        nonlocal completed
+        async with semaphore:
+            try:
+                page_texts[idx] = await asyncio.to_thread(
+                    extract_text_from_single_image,
+                    user_id,
+                    img_bytes,
+                    img_name,
+                    thinking_enabled,
+                    settings,
+                )
+            except Exception as e:
+                page_texts[idx] = None
+                failed_notices[idx] = str(e)
+            completed += 1
+            detail = f"اكتملت معالجة `{completed}` من `{total_images}` صفحة."
+            if failed_notices:
+                names = "، ".join(f"`{name}`" for name in list(failed_notices.keys())[:4])
+                detail += f"\nصفحات ستحصل على محاولة إنقاذ بعد اكتمال البقية: {names}"
+            async with progress_lock:
+                await edit_status(
+                    status_msg,
+                    "المعالجة مستمرة",
+                    detail,
+                    current=completed,
+                    total=total_images,
+                )
+
+    tasks = [
+        asyncio.create_task(worker(idx, img_bytes, img_name))
+        for idx, (img_bytes, img_name) in enumerate(images, start=1)
+    ]
+    await asyncio.gather(*tasks)
 
     retry_pages = [idx for idx, text in page_texts.items() if text is None]
     if retry_pages:
         await edit_status(
             status_msg,
-            "محاولة أخيرة للصفحات المتعثرة",
-            f"عدد الصفحات: `{len(retry_pages)}` — جاري إعادة المحاولة بوضع دقة كاملة.",
+            "محاولة إنقاذ أخيرة للصفحات المتعثرة",
+            f"عدد الصفحات: `{len(retry_pages)}` — جاري إعادة المحاولة بوضع دقة كاملة وتقسيم ذكي.",
         )
         for idx in retry_pages:
             img_bytes, img_name = images[idx - 1]
@@ -1708,7 +2061,7 @@ def mode_selection_sections():
         (
             f"### {emoji_manager.placeholder('circlecheck')} دقة كاملة\n"
             "يفعّل معالجة أعمق للحالات الصعبة جدًا.\n"
-            f"{emoji_manager.placeholder('alerttriangle')} **تنبيه:** قد يطول كثيرًا، وقد يصل إلى 30 دقيقة تقريبًا إذا كان عدد الصور 10."
+            f"{emoji_manager.placeholder('alerttriangle')} **تنبيه:** قد يطول كثيرًا مع الفصول الطويلة أو الشريطية (معالجة متوازية دقيقة الجزء بالجزء)."
         ),
     ]
 
@@ -2383,15 +2736,15 @@ async def extract(interaction: discord.Interaction):
             await edit_status(status_msg, "{emoji:circlex} خطأ", f"الحد الأقصى {MAX_IMAGES_PER_REQUEST} صور.", error=True)
             return
         for att in msg.attachments:
-            if att.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
-                data = await att.read()
+            if att.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp")):
+                data = ensure_valid_image(await att.read(), att.filename)
                 images.append((data, att.filename))
             elif att.filename.lower().endswith(".zip"):
                 data = await att.read()
-                images.extend(extract_images_from_zip_bytes(data))
+                images.extend(await asyncio.to_thread(extract_images_from_zip_bytes, data))
                 source_name = Path(att.filename).stem
             else:
-                await edit_status(status_msg, "{emoji:circlex} ملف غير مدعوم", f"الملف `{att.filename}` غير مدعوم.", error=True)
+                await edit_status(status_msg, "{emoji:circlex} ملف غير مدعوم", f"الملف `{att.filename}` غير مدعوم — الصور و `ZIP` فقط.", error=True)
                 return
     elif msg.content.startswith("http"):
         link = msg.content.strip()
@@ -2478,26 +2831,36 @@ def help_sections():
             "> **ماذا يفعل؟** يبدأ جلسة استخراج كاملة لفصل من أول صفحة لآخرها.\n"
             "> **كيف يعمل؟ اتبع هذه الخطوات بالترتيب:**\n"
             "> {emoji:num_1} نفّذ `/extract` وتظهر لك خيارات المعالجة: **سرعة عالية** (موصى به — نتيجة أسرع بدقة ممتازة) "
-            "أو **دقة كاملة** (معالجة أعمق للفصول الصعبة جدًا لكن أبطأ بكثير وقد تصل لـ30 دقيقة).\n"
+            "أو **دقة كاملة** (معالجة أعمق للفصول الصعبة جدًا لكن أبطأ بكثير).\n"
             "> {emoji:num_2} أرسل صور الفصل بإحدى **ثلاث طرق**:\n"
-            "> • إرفاق ما يصل إلى `10` صور مباشرة (رتبها بالأرقام).\n"
+            f"> • إرفاق ما يصل إلى `{MAX_IMAGES_PER_REQUEST}` صور مباشرة (رتبها بالأرقام).\n"
             "> • ملف `ZIP` داخله صور الفصل مرتبة الأسماء.\n"
             "> • رابط `Google Drive` لمجلد أو ملف — وسيقرأ حتى `1000` صورة.\n"
-            "> {emoji:num_3} تظهر **لوحة حالة حية** تتحديث مع كل صورة حتى انتهاء الفصل — "
+            "> {emoji:num_3} تظهر **لوحة حالة حية** والصفحات تُعالج **بالتوازي** لتقصير المدة — "
             "وإذا تعذّرت قراءة صفحة سيحاول البوت **إعادة المحاولة تلقائيًا** قبل الاستسلام.\n"
             "> {emoji:num_4} تصلك لوحة النتيجة: الملف داخلها مباشرة + **تقرير جودة** (الصور الفارغة، المدة، الصيغة).\n"
             "> **ملاحظات:** النص يُرتّب حسب أسماء الصور (مرّتها = مرتب الناتج)، ويُفصل كل صفحة بسطر `## اسم الصورة`."
+        ),
+        "## {emoji:zap} الصفحات الشريطية الطويلة — التقسيم الذكي",
+        (
+            "> كثير من فصول المانهوا تُدمج عموديًا في صورة واحدة بالغة الارتفاع، "
+            "وهذا يجعل النص **غير مقروء** للأنظمة البصرية مهما كانت جودتها لأن الصورة تُضغط بعنف.\n"
+            "> البوت يكشف هذه الصور ويقسّمها **تلقائيًا** إلى مقاطع متداخلة قابلة للقراءة، "
+            "ثم يدمج النص ويُزيل أي تكرار عند حدود المقاطع — "
+            "فصفحتك تخرج كاملة النص تحت اسمها الأصلي دون أي تدخل منك.\n"
+            "> في وضع **دقة كاملة** يحدث التقسيم فورًا لأقصى دقة، وفي وضع **سرعة عالية** يُستخدم كخطة إنقاذ ذكية عند الحاجة فقط."
         ),
         "## {emoji:message} الأمر `/translate` — ترجمة فصل جاهز",
         (
             "> **ماذا يفعل؟** يترجم ملف فصل **جاهز** (نص مستخرج سابقًا) بأسلوب ترجمة أدبية احترافية "
             "يحافظ على كل سطر حوار كفقاعة مستقلة دون دمج الفقاعات.\n"
-            "> **كيف يعمل؟**\n"
-            "> {emoji:num_1} نفّذ `/translate`.\n"
-            "> {emoji:num_2} أرفق ملف `TXT` أو `DOCX` — أو الصق النص مباشرة في خانة النص، أو أرسله في رسالة بعد تنفيذ الأمر.\n"
-            "> {emoji:num_3} اختر لغة الترجمة (اختياري — الافتراضي من إعداداتك في `/setting`).\n"
+            "> **كيف يعمل؟ نفس تفاعل `/extract` تمامًا:**\n"
+            "> {emoji:num_1} نفّذ `/translate` واختر وضع المعالجة: **سرعة عالية** (بدون تفكير — أسرع) أو **دقة كاملة** (مع تفكير — أعمق وأبطأ).\n"
+            "> {emoji:num_2} أرسل المصدر: ملف `TXT` أو `DOCX` مرفقًا في رسالة — أو الصق نص الفصل مباشرة في رسالة واحدة.\n"
+            "> {emoji:num_3} تظهر **لوحة حالة حية** — والفصول الطويلة تُترجم على أجزاء متتابعة مع عرض تقدم واضح (مثل: الجزء `2` من `4`).\n"
             "> {emoji:num_4} تصلك لوحة النتيجة والملف المترجم داخلها مباشرة.\n"
-            "> **ملاحظة:** الترجمة تستهلك **نقطة واحدة** مثل الاستخراج، وتعمل أيضًا بالبريفكس `!ترجمة`."
+            "> **ملاحظات:** الترجمة تستهلك **نقطة واحدة** مثل الاستخراج، وتعمل أيضًا بالبريفكس `!ترجمة`، "
+            "ولغتها من إعداداتك في `/setting` أو بتمريرها مع الأمر مباشرة."
         ),
         "## {emoji:settings} الأمر `/setting` — الإعدادات",
         (
@@ -2521,11 +2884,11 @@ def help_sections():
         ),
         "## {emoji:alerttriangle} حدود وملاحظات",
         (
-            "> • الحد الأقصى `10` صور في الرسالة الواحدة — للفصول الطويلة استخدم `ZIP` أو `Google Drive`.\n"
-            "> • الصيغ المدعومة للاستخراج: `PNG` `JPG` `JPEG` `WEBP` — وللترجمة: `TXT` `DOCX`.\n"
-            "> • الصورة التي تظهر (فارغة) في التقرير تعني أنها بلا نص مقروء.\n"
+            f"> • الحد الأقصى `{MAX_IMAGES_PER_REQUEST}` صور في الرسالة الواحدة — للفصول الطويلة استخدم `ZIP` أو `Google Drive`.\n"
+            "> • الصيغ المدعومة للاستخراج: `PNG` `JPG` `JPEG` `WEBP` `BMP` — وللترجمة: `TXT` `DOCX`.\n"
+            "> • الصورة التي تظهر (فارغة) في التقرير تعني أنها **بلا نص مقروء فعلاً** حتى بعد التقسيم وإعادة المحاولة.\n"
             "> • عند تفعيل الترجمة تتم معالجة نصية إضافية بعد الاستخراج، فتطول مدة التنفيذ قليلًا.\n"
-            "> • أوامر البريفكس المتاحة: `!extract` `!translate` `!اعدادات` `!بروفايل` `!مساعدة`."
+            "> • أوامر البريفكس المتاحة: `!استخراج` `!ترجمة` `!اعدادات` `!بروفايل` `!مساعدة`."
         ),
     ]
 
@@ -2560,10 +2923,11 @@ async def setting(interaction: discord.Interaction):
 
 def translation_upload_sections():
     return [
-        f"## {emoji_manager.placeholder('message')} أرسل الفصل المطلوب ترجمته.",
-        f"{emoji_manager.placeholder('folderopen')} **الطريقة الأولى:** أرفق ملف فصل بصيغة `TXT` أو `DOCX`.",
+        f"## {emoji_manager.placeholder('message')} الخطوة الثانية — أرسل الفصل المطلوب ترجمته.",
+        f"{emoji_manager.placeholder('folderopen')} **الطريقة الأولى:** أرفق ملف الفصل بصيغة `TXT` أو `DOCX` في رسالة واحدة.",
         f"{emoji_manager.placeholder('list')} **الطريقة الثانية:** الصق نص الفصل مباشرة في رسالة واحدة.",
-        f"-# {emoji_manager.placeholder('infocircle')} الترجمة تستهلك نقطة واحدة مثل الاستخراج.",
+        f"{emoji_manager.placeholder('clock')} لديك `5` دقائق لإرسال المصدر من لحظة هذه اللوحة.",
+        f"-# {emoji_manager.placeholder('infocircle')} الترجمة تستهلك نقطة واحدة مثل الاستخراج — والفصول الطويلة تُترجم على أجزاء تلقائيًا مع عرض التقدم.",
     ]
 
 
@@ -2571,7 +2935,7 @@ async def send_translation_upload_prompt(destination):
     return await send_panel(destination, sections=translation_upload_sections())
 
 
-@bot.tree.command(name="translate", description="ترجمة فصل جاهز — أرفق ملف TXT أو DOCX أو الصق النص")
+@bot.tree.command(name="translate", description="ترجمة فصل جاهز — اختر وضع المعالجة ثم أرسل ملف TXT/DOCX أو الصق النص")
 @app_commands.describe(
     file="ملف الفصل بصيغة TXT أو DOCX",
     text="أو الصق نص الفصل مباشرة",
@@ -2604,6 +2968,15 @@ async def translate(interaction: discord.Interaction,
         return
 
     target = language.value if language else profile["settings"].get("translate_target", "ar")
+
+    # الخطوة الأولى — اختيار وضع المعالجة (نفس تفاعل /extract تمامًا)
+    view = ModeSelectView(user_id)
+    await send_mode_selection(interaction.followup, view)
+    await view.wait()
+    if not view.confirmed:
+        await interaction.followup.send("{emoji:clock} **انتهى وقت اختيار وضع المعالجة. أعد تشغيل الأمر عندما تكون جاهزًا.**", ephemeral=True)
+        return
+    thinking_enabled = view.thinking_enabled
 
     chapter_text = ""
     source_stem = "chapter"
@@ -2667,6 +3040,7 @@ async def translate(interaction: discord.Interaction,
         source_stem,
         target,
         profile["settings"].get("output_format", "txt"),
+        thinking_enabled=thinking_enabled,
     )
 
 
@@ -2907,6 +3281,16 @@ async def prefix_translate(ctx):
         return
 
     target = profile["settings"].get("translate_target", "ar")
+
+    # الخطوة الأولى — اختيار وضع المعالجة (نفس تفاعل !استخراج تمامًا)
+    view = ModeSelectView(user_id)
+    await send_mode_selection(ctx, view)
+    await view.wait()
+    if not view.confirmed:
+        await ctx.send("{emoji:clock} **انتهى وقت اختيار وضع المعالجة. أعد تشغيل الأمر عندما تكون جاهزًا.**")
+        return
+    thinking_enabled = view.thinking_enabled
+
     chapter_text = ""
     source_stem = "chapter"
 
@@ -2958,6 +3342,7 @@ async def prefix_translate(ctx):
         source_stem,
         target,
         profile["settings"].get("output_format", "txt"),
+        thinking_enabled=thinking_enabled,
     )
 
 
@@ -3013,10 +3398,10 @@ async def prefix_extract(ctx):
                 await edit_status(status_msg, "{emoji:circlex} خطأ", f"الحد الأقصى {MAX_IMAGES_PER_REQUEST} صور.", error=True)
                 return
             for att in msg.attachments:
-                if att.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
-                    images.append((await att.read(), att.filename))
+                if att.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp")):
+                    images.append((ensure_valid_image(await att.read(), att.filename), att.filename))
                 elif att.filename.lower().endswith(".zip"):
-                    images.extend(extract_images_from_zip_bytes(await att.read()))
+                    images.extend(await asyncio.to_thread(extract_images_from_zip_bytes, await att.read()))
                     source_name = Path(att.filename).stem
                 else:
                     await edit_status(status_msg, "{emoji:circlex} ملف غير مدعوم", f"`{att.filename}`", error=True)
