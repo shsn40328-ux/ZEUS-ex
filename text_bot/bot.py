@@ -33,7 +33,7 @@ BOT_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "656783724662226963"))
 TEMP_API_URL = os.getenv("TEMP_API_URL", "").rstrip("/")
 BASE_QWEN_URL = os.getenv("BASE_QWEN_URL", "https://chat.qwen.ai/api/v2").rstrip("/")
-BOT_VERSION = os.getenv("BOT_VERSION", "2.4.0")
+BOT_VERSION = os.getenv("BOT_VERSION", "2.5.0")
 GDRIVE_API_KEY = os.getenv("GDRIVE_API_KEY", "").strip()
 
 MAX_IMAGES_PER_REQUEST = int(os.getenv("MAX_IMAGES_PER_REQUEST", "10"))
@@ -57,8 +57,9 @@ TILE_MAX_RETRIES = int(os.getenv("TILE_MAX_RETRIES", "2"))
 # الجزء الذي ما زال طويلًا وفشل وحده يُعاد تقسيمه وحده مرة واحدة (ضمان نادر للصفحات العملاقة)
 TILE_SUB_SPLIT_DEPTH = max(0, int(os.getenv("TILE_SUB_SPLIT_DEPTH", "1")))
 
-# المراجعة الآلية بعد الاستخراج — أي مقاطع أجنبية متبقية (إنجليزي/كوري/صيني)
-# تُترجم تلقائيًا وتُلصق مكانها، وحروف التصنيف (A, S, SS, C) تبقى كما هي.
+# المراجعة الآلية بعد الترجمة — أي مقاطع أجنبية متبقية (إنجليزي/كوري/صيني...)
+# في النص المُترجم تُكتشف آليًا وتُترجم وتُلصق مكانها، وحروف التصنيف (A, S, SS, C) تبقى كما هي.
+# نص الاستخراج نفسه يبقى دائمًا باللغة الأصلية كما في الصورة — لا تُمس إطلاقًا.
 FOREIGN_REVIEW_ENABLED = os.getenv("FOREIGN_REVIEW_ENABLED", "1") == "1"
 
 # الترجمة المجزأة — الفصول الطويلة تُترجم على مجموعات حتى لا ينقطع الناتج
@@ -277,7 +278,7 @@ def result_panel_view(*, user_id, total_images, empty_images, duration_text, for
     # الملفات داخل الرسالة
     container.add_item(discord.ui.TextDisplay(emojize(
         f"### {emoji_manager.placeholder('folderopen')} الملفات\n"
-        f"> {emoji_manager.placeholder('list')} **النص المستخرج:** `{main_name}`"
+        f"> {emoji_manager.placeholder('list')} **النص المستخرج (اللغة الأصلية):** `{main_name}`"
     )))
     container.add_item(discord.ui.File(f"attachment://{main_name}"))
     if translation:
@@ -694,7 +695,12 @@ def build_extraction_prompt(settings):
         "EXTRACTION RULES:\n"
         "1. Extract all dialogue text from this image accurately.\n"
         "2. Order text by correct reading flow (right-to-left, top-to-bottom).\n"
-        "3. CRITICAL — Bubble merging rule: Each speech bubble is ONE single "
+        "3. ORIGINAL LANGUAGE — NEVER TRANSLATE: Output every line EXACTLY in "
+        "the language it is written in inside the image. Korean dialogue stays "
+        "Korean, English stays English, Arabic stays Arabic. Do NOT translate, "
+        "do NOT convert the language, do NOT add a translated version. "
+        "Translation is handled by a separate later step — never by you.\n"
+        "4. CRITICAL — Bubble merging rule: Each speech bubble is ONE single "
         "text unit. If the text inside a bubble spans multiple visual lines "
         "due to bubble shape, merge them into a single line with normal spaces. "
         "Example: if the bubble shows:\n"
@@ -702,11 +708,11 @@ def build_extraction_prompt(settings):
         "   wants to\n"
         "   bake cookies\n"
         "Output it as: King Zeus wants to bake cookies\n"
-        f"4. {spacing_rule}\n"
-        f"5. {sfx_rule}\n"
-        "6. Output extracted text ONLY. No headers, no labels, no commentary, "
+        f"5. {spacing_rule}\n"
+        f"6. {sfx_rule}\n"
+        "7. Output extracted text ONLY. No headers, no labels, no commentary, "
         "no translation, no explanations.\n"
-        "7. NO-TEXT PROTOCOL: Only if the image contains absolutely no readable "
+        "8. NO-TEXT PROTOCOL: Only if the image contains absolutely no readable "
         "text at all (no dialogue, no captions, no written words anywhere), "
         "output exactly this single word and nothing else: No\n"
         "   Before answering No you MUST carefully re-check every panel and every "
@@ -763,7 +769,19 @@ def build_translation_prompt(target_language):
         "- Adapt idioms and expressions naturally to the target language.\n"
         "- Transliterate character and place names consistently.\n"
         "- Sound effects may be rendered expressively in the target language.\n"
-        "- Translate everything faithfully; do not censor, summarize or skip lines."
+        "- Translate everything faithfully; do not censor, summarize or skip lines.\n"
+        "\n"
+        "REGISTER — STRICT:\n"
+        f"- Write ONLY in the formal literary standard register of {lang}.\n"
+        "- NEVER use colloquial dialects, street speech or slang — not even for "
+        "casual dialogue, jokes or young characters. Their informal voice is "
+        "conveyed through simple plain word choice inside the standard literary "
+        "register, never through dialect.\n"
+        "- NEVER add diacritics or vowel marks (التشكيل: الفتحة، الضمة، الكسرة، "
+        "التنوين، الشدة، السكون). Output plain unvocalized text exactly like "
+        "official published releases. A diacritic is allowed only in the rare "
+        "case where leaving the word plain would create real ambiguity — "
+        "otherwise absolutely none."
     )
 
 
@@ -773,6 +791,16 @@ def _strip_code_fences(text):
         text = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", text)
         text = re.sub(r"\n?```$", "", text)
     return text.strip()
+
+
+# تذكير يُلحق بكل جزء في وضع السرعة (بدون تفكير) — يعوّض غياب المعالجة الأعمق
+# ليضمن الفصحى الأدبية ومنع العامية والحركات الزائدة في الوضعين على حد سواء.
+SPEED_MODE_REMINDER = (
+    "QUALITY REMINDER (fast mode): This is a professional LITERARY translation. "
+    "Formal literary standard language ONLY — strictly no colloquial dialects, "
+    "no slang, no street speech. And strictly NO diacritics/vowel marks "
+    "(تشكيل/حركات) except absolute necessity."
+)
 
 
 def request_qwen_text_completion(user_id, prompt, *, service_type="chat", max_attempts=3, thinking_enabled=False):
@@ -871,6 +899,25 @@ def _sanitize_translation(text):
     return cleaned.strip()
 
 
+# أنماط كشف التشكيل وحروف العربية — تخدم شبكة أمان الحركات
+_TASHKEEL_RE = re.compile(r"[\u064B-\u0655\u0670]")
+_ARABIC_LETTER_RE = re.compile(r"[\u0621-\u064A]")
+
+
+def _strip_excessive_tashkeel(text):
+    """
+    شبكة أمان ضد الإفراط في الحركات (الفتحة، الضمة، الكسرة، التنوين، الشدة، السكون):
+    الترجمة الأدبية المنشورة تكون نصًا ساديًا بلا تشكيل، فإن تجاوز عدد الحركات
+    حدًّا صغيرًا زُلت كلها؛ أما الاستخدام الندري للضرورة (عدد قليل جدًا) فيبقى كما هو.
+    """
+    if not text:
+        return text or ""
+    marks = _TASHKEEL_RE.findall(text)
+    if len(marks) <= max(8, len(_ARABIC_LETTER_RE.findall(text)) // 200):
+        return text  # استخدام محدود جدًا — يُحتمل أنها ضرورية فتبقى
+    return _TASHKEEL_RE.sub("", text)
+
+
 def _split_translation_chunks(chapter_text, max_lines=None, max_chars=None):
     """
     يقسم نص الفصل إلى مجموعات ترجمة متوازنة:
@@ -940,6 +987,9 @@ def translate_chapter_text(user_id, chapter_text, settings, *, thinking_enabled=
     الفصول الطويلة تُقسم تلقائيًا إلى مجموعات مترجمة بالتتابع
     (مع تقدم حي عبر progress_cb) حتى لا ينقطع الناتج،
     ووضع الدقة الكاملة يفعّل المعالجة الأعمق لكل مجموعة.
+    الناتج النهائي يخضع لمراجعتين آليتين:
+    1) مراجعة المقاطع الأجنبية المتبقية — تُترجم وتُلصق مكانها (حروف التصنيف محمية).
+    2) شبكة أمان الحركات — التشكيل المفرط يُزال إلا الضرورة النادرة.
     """
     target = (settings or {}).get("translate_target", "ar")
     chunks = _split_translation_chunks(chapter_text)
@@ -960,6 +1010,7 @@ def translate_chapter_text(user_id, chapter_text, settings, *, thinking_enabled=
         )
         prompt = (
             build_translation_prompt(target)
+            + ("\n\n" + SPEED_MODE_REMINDER if not thinking_enabled else "")
             + part_note
             + "\n\n=== CHAPTER TEXT START ===\n"
             + chunk
@@ -972,7 +1023,14 @@ def translate_chapter_text(user_id, chapter_text, settings, *, thinking_enabled=
         if not cleaned:
             raise Exception(f"جاءت ترجمة الجزء {i} فارغة — حاول مرة أخرى.")
         outputs.append(cleaned)
-    return "\n\n".join(outputs) if total > 1 else outputs[0]
+
+    final_text = "\n\n".join(outputs) if total > 1 else outputs[0]
+    # المراجعة الآلية على مخرجات الترجمة — أي مقطع أجنبي متبقٍ يُترجم ويُلصق مكانه
+    # (حروف التصنيف A/S/SS/C محمية، وأي خلل يعيد النص كما هو)
+    final_text = _review_foreign_text(user_id, final_text, target_code=target)
+    if target == "ar":
+        final_text = _strip_excessive_tashkeel(final_text)
+    return final_text
 
 
 # ============================================================
@@ -1705,16 +1763,12 @@ def extract_text_from_single_image(user_id, image_bytes, image_name, thinking_en
     2) فقط إذا فشلت الصورة الطويلة بسبب طولها (خطأ تقني أو إعلان No غير قابل للتصديق)
        تُقسّم إلى حد أقصى TILE_MAX_PARTS أجزاء ويُدمج نصها.
     3) الفشل التقني الحقيقي يرفع استثناءً ليستلمه خط الأنابيب في مرحلة الإنقاذ.
-    4) كل ناتج ناجح يمرّ على المراجعة الآلية لترجمة أي مقاطع أجنبية متبقية.
+    4) الناتج يبقى دائمًا باللغة الأصلية كما في الصورة — لا ترجمة هنا إطلاقًا
+       (الترجمة والمراجعة الآلية تحدث لاحقًا على مخرجات الترجمة فقط).
     progress_cb: دالة اختيارية (stage, name, part, total, label) لتحديث مؤشر الانتظار
     بأمان من داخل خيوط المعالجة.
     """
     last_error = None
-
-    def finish(result):
-        if (result or "").strip():
-            return _review_foreign_text(user_id, result)
-        return result or ""
 
     # هل الصورة شريطًا طويلًا؟ (فقط الطويلة هي المرشحة للتقسيم عند الفشل)
     long_image = False
@@ -1733,7 +1787,7 @@ def extract_text_from_single_image(user_id, image_bytes, image_name, thinking_en
             )
             cleaned = _sanitize_extraction(raw)
             if cleaned != _EXTRACTION_FAILED_MARKER:
-                return finish(cleaned)
+                return cleaned  # نص أصلي خام — لا مراجعة ولا ترجمة هنا
             last_error = None  # إعلان (No) موثّق — ليس خطأ تقنيًا
             if long_image:
                 # صورة طويلة أُعلن (No) عليها؟ الرد غير قابل للوثيق لأن الصورة
@@ -1764,7 +1818,7 @@ def extract_text_from_single_image(user_id, image_bytes, image_name, thinking_en
                 progress_cb=progress_cb, display_name=image_name,
             )
             if merged.strip():
-                return finish(merged)
+                return merged  # نص أصلي خام — لا مراجعة ولا ترجمة هنا
             # حتى مع التقسيم: لا نص إطلاقًا — صورة فارغة مؤكدة
             return ""
 
@@ -1774,10 +1828,11 @@ def extract_text_from_single_image(user_id, image_bytes, image_name, thinking_en
 
 
 # ============================================================
-# المراجعة الآلية — ترجمة المقاطع الأجنبية المتبقية في نص الاستخراج
-# أحيانًا يسلّب الاستخراج كلمات أو حروفًا إنجليزية/كورية/صينية —
+# المراجعة الآلية — ترجمة المقاطع الأجنبية المتبقية في النص المُترجم
+# أحيانًا تُهلوس الترجمة فتبقى فيها كلمات أو حروف أجنبية —
 # تُكتشف آليًا، تُترجم، ثم يُلصق الناتج مكانها بدقة دون المساس بأي شيء آخر.
 # حروف التصنيف مثل A, S, SS, C تُستثنى — فهي صحيحة كما هي.
+# تُطبّق على مخرجات الترجمة فقط — نص الاستخراج الخام لا يُمس إطلاقًا.
 # ============================================================
 _FOREIGN_RANK_TOKEN_RE = re.compile(r"^[A-FS]{1,3}$")
 # عبارة لاتينية متصلة (كلمات متتابعة بمسافات تُترجم معًا كجملة واحدة) مع علامات الترقيم الختامية
@@ -1789,6 +1844,11 @@ _FOREIGN_ASIAN_RE = re.compile(
     "(?:[ \t]*[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\uAC00-\uD7A3\u3130-\u318F\u1100-\u11FF])*"
 )
 _FOREIGN_REVIEW_MAX_SNIPPETS = 80
+# مسار متصل من الحروف العربية — يُستخدم عندما تكون لغة الهدف لاتينية (الترجمة إلى إنجليزي مثلًا)
+_FOREIGN_ARABIC_RE = re.compile(
+    "[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]"
+    "(?:[ \t]*[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF])*"
+)
 
 
 _FOREIGN_RANK_STRIP = "?!,.;:؟*"
@@ -1800,7 +1860,7 @@ def _is_rank_letters(phrase):
     return bool(tokens) and all(t and _FOREIGN_RANK_TOKEN_RE.match(t) for t in tokens)
 
 
-def _collect_foreign_segments(text):
+def _collect_foreign_segments(text, target_code="ar"):
     """
     يجمع المقاطع الأجنبية الفريدة (إنجليزية/كورية/صينية/يابانية) من نص مستخرج.
     - حروف التصنيف المفردة/المزدوجة بأحرف كبيرة (A, S, SS, C...) تبقى كما هي.
@@ -1813,12 +1873,19 @@ def _collect_foreign_segments(text):
         if not line_txt.strip() or line_txt.strip().startswith("## "):
             continue
         found = []
-        for m in _FOREIGN_LATIN_RE.finditer(line_txt):
-            if _is_rank_letters(m.group()):
-                continue  # حروف تصنيف — تبقى كما هي
-            found.append(m.group())
-        for m in _FOREIGN_ASIAN_RE.finditer(line_txt):
-            found.append(m.group())
+        if target_code == "ar":
+            for m in _FOREIGN_LATIN_RE.finditer(line_txt):
+                if _is_rank_letters(m.group()):
+                    continue  # حروف تصنيف — تبقى كما هي
+                found.append(m.group())
+            for m in _FOREIGN_ASIAN_RE.finditer(line_txt):
+                found.append(m.group())
+        else:
+            # لغة هدف لاتينية (إنجليزي/فرنسي...) — المتبقي هو العربي والآسيوي
+            for m in _FOREIGN_ARABIC_RE.finditer(line_txt):
+                found.append(m.group())
+            for m in _FOREIGN_ASIAN_RE.finditer(line_txt):
+                found.append(m.group())
         for seg in found:
             seg = seg.strip()
             if not seg:
@@ -1831,16 +1898,17 @@ def _collect_foreign_segments(text):
     return segments
 
 
-def _review_foreign_text(user_id, text):
+def _review_foreign_text(user_id, text, *, target_code="ar"):
     """
-    المراجعة الآلية لنتيجة الاستخراج:
-    إذا بقي في النص أي مقطع أجنبي يُرسل مع سياقه للترجمة، ثم يُلصق الناتج مكانه.
+    المراجعة الآلية لنتيجة الترجمة:
+    إذا بقي في النص المترجم أي مقطع أجنبي (لا يطابق لغة الهدف) يُرسل مع سياقه
+    للترجمة، ثم يُلصق الناتج مكانه. حروف التصنيف A/S/SS/C محمية.
     أي خلل في المراجعة يعيد النص الأصلي كما هو — لا يفسد النص أبدًا.
     """
     if not FOREIGN_REVIEW_ENABLED or not (text or "").strip():
         return text or ""
     try:
-        segments = _collect_foreign_segments(text)
+        segments = _collect_foreign_segments(text, target_code)
         if not segments:
             return text
         if len(segments) > _FOREIGN_REVIEW_MAX_SNIPPETS:
@@ -1849,15 +1917,35 @@ def _review_foreign_text(user_id, text):
             {"id": str(i + 1), "text": seg["text"], "context": seg["line"][:200]}
             for i, seg in enumerate(segments)
         ]
+        lang = TRANSLATION_TARGETS.get(target_code, TRANSLATION_TARGETS["ar"])
+        if target_code == "ar":
+            role_line = "You are a precise post-editing assistant for Arabic manhwa dialogue."
+            leftover_line = (
+                "The translated text was supposed to be fully Arabic, but a few foreign "
+                "fragments (English, Korean, Chinese or Japanese) were left inside it."
+            )
+            style_line = (
+                "Translate every fragment into natural, fluent literary Modern Standard Arabic "
+                "(fusha — never slang, never dialects, never diacritics/tashkeel) that fits its "
+                "context — concise manhwa dialogue style, exactly as it should read in place."
+            )
+        else:
+            role_line = f"You are a precise post-editing assistant for {lang} manhwa dialogue."
+            leftover_line = (
+                f"The translated text was supposed to be fully {lang}, but a few foreign "
+                "fragments (Arabic, Korean, Chinese or Japanese) were left inside it."
+            )
+            style_line = (
+                f"Translate every fragment into natural, fluent {lang} that fits its "
+                "context — concise manhwa dialogue style, exactly as it should read in place."
+            )
         prompt = (
-            "You are a precise post-editing assistant for Arabic manhwa dialogue.\n"
-            "The extracted text was supposed to be fully Arabic, but a few foreign "
-            "fragments (English, Korean, Chinese or Japanese) were left inside it.\n"
+            role_line + "\n"
+            + leftover_line + "\n"
             "You will receive a JSON array of these fragments; each fragment has the "
             "line it appeared in as context.\n"
-            "Translate every fragment into natural, fluent Arabic that fits its "
-            "context — concise manhwa dialogue style, exactly as it should read in place.\n"
-            "Return ONLY a strict JSON object mapping each id to its Arabic translation, "
+            + style_line + "\n"
+            "Return ONLY a strict JSON object mapping each id to its translation, "
             'like {"1": "...", "2": "..."} — no commentary, no code fences, no extra keys.\n\n'
             "FRAGMENTS:\n" + json.dumps(payload, ensure_ascii=False)
         )
@@ -3089,9 +3177,10 @@ def help_sections():
             "> • رابط `Google Drive` لمجلد أو ملف — وسيقرأ حتى `1000` صورة.\n"
             "> {emoji:num_3} تظهر **لوحة حالة حية** والصفحات تُعالج **بالتوازي** لتقصير المدة — "
             "وإذا تعذّرت قراءة صفحة سيحاول البوت **إعادة المحاولة تلقائيًا** قبل الاستسلام، "
-            "ويخضع الناتج ل**مراجعة آلية** تترجم أي مقاطع أجنبية متبقية وتلصقها مكانها (مع إبقاء حروف التصنيف مثل `A` `S` `SS` `C` كما هي).\n"
+            "وملف الاستخراج يخرج دائمًا **باللغة الأصلية** كما في الصور تمامًا (لا ترجمة فيه إطلاقًا).\n"
             "> {emoji:num_4} تصلك لوحة النتيجة: الملف داخلها مباشرة + **تقرير جودة** (الصور الفارغة، المدة، الصيغة).\n"
-            "> **ملاحظات:** النص يُرتّب حسب أسماء الصور (مرّتها = مرتب الناتج)، ويُفصل كل صفحة بسطر `## اسم الصورة`."
+            "> **ملاحظات:** النص يُرتّب حسب أسماء الصور (مرّتها = مرتب الناتج)، ويُفصل كل صفحة بسطر `## اسم الصورة`.\n"
+            "> **عند تفعيل الترجمة** من الإعدادات تصلك لوحة بملفين: **النص المستخرج (اللغة الأصلية)** + **الترجمة الأدبية**."
         ),
         "## {emoji:zap} الصفحات الشريطية الطويلة — تقسيم عند الحاجة فقط",
         (
@@ -3107,7 +3196,11 @@ def help_sections():
         "## {emoji:message} الأمر `/translate` — ترجمة فصل جاهز",
         (
             "> **ماذا يفعل؟** يترجم ملف فصل **جاهز** (نص مستخرج سابقًا) بأسلوب ترجمة أدبية احترافية "
-            "يحافظ على كل سطر حوار كفقاعة مستقلة دون دمج الفقاعات.\n"
+            "يحافظ على كل سطر حوار كفقاعة مستقلة دون دمج الفقاعات، "
+            "ودائمًا **فصحى أدبية** بلا عامية ولا لهجات و**بدون حركات/تشكيل** إلا للضرورة القصوى — "
+            "في الوضعين (السرعة والدقة) على حد سواء.\n"
+            "> ويخضع الناتج ل**مراجعة آلية** تترجم أي مقطع أجنبي متبقٍ وتلصقه مكانه "
+            "(مع إبقاء حروف التصنيف مثل `A` `S` `SS` `C` كما هي).\n"
             "> **كيف يعمل؟ نفس تفاعل `/extract` تمامًا:**\n"
             "> {emoji:num_1} نفّذ `/translate` واختر وضع المعالجة: **سرعة عالية** (بدون تفكير — أسرع) أو **دقة كاملة** (مع تفكير — أعمق وأبطأ).\n"
             "> {emoji:num_2} أرسل المصدر: ملف `TXT` أو `DOCX` مرفقًا في رسالة — أو الصق نص الفصل مباشرة في رسالة واحدة.\n"
