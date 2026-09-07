@@ -33,7 +33,7 @@ BOT_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "656783724662226963"))
 TEMP_API_URL = os.getenv("TEMP_API_URL", "").rstrip("/")
 BASE_QWEN_URL = os.getenv("BASE_QWEN_URL", "https://chat.qwen.ai/api/v2").rstrip("/")
-BOT_VERSION = os.getenv("BOT_VERSION", "2.3.0")
+BOT_VERSION = os.getenv("BOT_VERSION", "2.4.0")
 GDRIVE_API_KEY = os.getenv("GDRIVE_API_KEY", "").strip()
 
 MAX_IMAGES_PER_REQUEST = int(os.getenv("MAX_IMAGES_PER_REQUEST", "10"))
@@ -46,13 +46,20 @@ MAX_RETRY_PER_IMAGE = int(os.getenv("MAX_RETRY_PER_IMAGE", "3"))
 EXTRACTION_CONCURRENCY = max(1, int(os.getenv("EXTRACTION_CONCURRENCY", "2")))
 
 # التقسيم الذكي للصور الشريطية الطويلة (فصول المانهوا المدموجة عموديًا)
-# الصور الأطول من TILE_MAX_EDGE تُعامل كشريط طويل، وتُقطع إلى أجزاء بارتفاع TILE_HEIGHT
+# لا تقسيم استباقي أبدًا: الصورة تُجرّب كاملة أولًا في الوضعين،
+# وعند الفشل بسبب الطول فقط تُقسّم إلى أجزاء متساوية بحد أقصى TILE_MAX_PARTS
 # مع تداخل TILE_OVERLAP حتى لا تنقطع فقاعة حوار عند الحدود.
-TILE_MAX_EDGE = int(os.getenv("TILE_MAX_EDGE", "6000"))
-TILE_HEIGHT = int(os.getenv("TILE_HEIGHT", "3200"))
+TILE_MAX_EDGE = int(os.getenv("TILE_MAX_EDGE", "6000"))         # عتبة اعتبار الصورة شريطًا طويلًا
+TILE_HEIGHT = int(os.getenv("TILE_HEIGHT", "3200"))            # الارتفاع المستهدف للجزء الواحد
+TILE_MAX_PARTS = max(2, int(os.getenv("TILE_MAX_PARTS", "3")))  # أقصى عدد أجزاء للصورة كاملة
 TILE_OVERLAP = int(os.getenv("TILE_OVERLAP", "320"))
-TILE_MIN_TAIL = int(os.getenv("TILE_MIN_TAIL", "900"))
 TILE_MAX_RETRIES = int(os.getenv("TILE_MAX_RETRIES", "2"))
+# الجزء الذي ما زال طويلًا وفشل وحده يُعاد تقسيمه وحده مرة واحدة (ضمان نادر للصفحات العملاقة)
+TILE_SUB_SPLIT_DEPTH = max(0, int(os.getenv("TILE_SUB_SPLIT_DEPTH", "1")))
+
+# المراجعة الآلية بعد الاستخراج — أي مقاطع أجنبية متبقية (إنجليزي/كوري/صيني)
+# تُترجم تلقائيًا وتُلصق مكانها، وحروف التصنيف (A, S, SS, C) تبقى كما هي.
+FOREIGN_REVIEW_ENABLED = os.getenv("FOREIGN_REVIEW_ENABLED", "1") == "1"
 
 # الترجمة المجزأة — الفصول الطويلة تُترجم على مجموعات حتى لا ينقطع الناتج
 TRANSLATION_CHUNK_LINES = int(os.getenv("TRANSLATION_CHUNK_LINES", "60"))
@@ -1530,37 +1537,41 @@ def _delete_chat_quiet(user_id, chat_id):
         pass
 
 
+def choose_tile_part_count(height):
+    """عدد الأجزاء المناسب لصورة طولها معيّن — لا يتجاوز TILE_MAX_PARTS أبدًا."""
+    if height <= TILE_MAX_EDGE:
+        return 1
+    return min(TILE_MAX_PARTS, max(2, -(-height // TILE_HEIGHT)))
+
+
 def split_long_image(image_bytes):
     """
-    يقسم الصور الشريطية الطويلة (فصول مانهوا مدموجة عموديًا) إلى أجزاء قابلة للقراءة.
-    الصورة الأصلية بهذا الارتفاع تُضغط بشدة عند المزوّد فتفقد النص قابلية القراءة —
-    التقسيم يعيد لكل جزء دقته الكاملة.
-    يعيد قائمة (bytes, label) — بعنصر واحد إذا كانت الصورة عادية لا تحتاج تقسيمًا.
+    يقسم الصورة الشريطية الطويلة إلى أجزاء متساوية قابلة للقراءة
+    بحد أقصى TILE_MAX_PARTS أجزاء (ثلاثة فقط — لا سبعة).
+    يُستدعى فقط بعد فشل الصورة كاملة بسبب طولها — ليس خطوة افتراضية أبدًا.
+    يعيد قائمة (bytes, label, height) — بعنصر واحد إذا كانت الصورة عادية لا تحتاج تقسيمًا.
     """
     img = Image.open(io.BytesIO(image_bytes))
     img.load()
     w, h = img.size
     if h <= TILE_MAX_EDGE:
-        return [(image_bytes, "full")]
+        return [(image_bytes, "full", h)]
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
+    parts = choose_tile_part_count(h)
+    step = -(-h // parts)
     tiles = []
-    overlap = min(TILE_OVERLAP, max(0, TILE_HEIGHT // 4))
-    top = 0
-    part_no = 1
-    while top < h:
-        bottom = min(top + TILE_HEIGHT, h)
-        # ذيل صغير جدًا؟ ادمجه مع الجزء الأخير بدل جزء شبه فارغ
-        if h - bottom < TILE_MIN_TAIL:
-            bottom = h
+    for i in range(parts):
+        top = 0 if i == 0 else max(0, i * step - TILE_OVERLAP)
+        bottom = h if i == parts - 1 else min(h, (i + 1) * step)
+        if bottom - top < 40:
+            continue
         crop = img.crop((0, top, w, bottom))
         buf = io.BytesIO()
         crop.save(buf, format="JPEG", quality=92)
-        tiles.append((buf.getvalue(), f"part{part_no}"))
-        if bottom >= h:
-            break
-        top = bottom - overlap if bottom - overlap > top else bottom
-        part_no += 1
+        tiles.append((buf.getvalue(), f"part{i + 1}", bottom - top))
+    if not tiles:
+        return [(image_bytes, "full", h)]
     return tiles
 
 
@@ -1593,26 +1604,75 @@ def _merge_tile_texts(parts):
     return "\n".join(merged).strip()
 
 
-def _extract_tiled(user_id, tiles, thinking_enabled, settings):
+def _sub_split_tile(user_id, tile_bytes, shown_label, thinking_enabled, settings, depth, progress_cb, display_name):
+    """
+    خطة الضمان للصفحات العملاقة: جزء واحد ما زال طويلًا وفشل وحده →
+    يُعاد تقسيمه وحده (وليس الصورة كلها) ويُستخرج. يعيد النص أو None عند الاستحالة.
+    """
+    if depth >= TILE_SUB_SPLIT_DEPTH:
+        return None
+    try:
+        sub_tiles = split_long_image(tile_bytes)
+    except Exception:
+        return None
+    if len(sub_tiles) <= 1:
+        return None
+    if progress_cb and display_name:
+        try:
+            progress_cb("sub_split_start", display_name, 0, 0, shown_label)
+        except Exception:
+            pass
+    return _extract_tiled(
+        user_id, sub_tiles, thinking_enabled, settings,
+        depth=depth + 1, progress_cb=progress_cb,
+        display_name=display_name, label_prefix=f"{shown_label}/",
+    )
+
+
+def _extract_tiled(user_id, tiles, thinking_enabled, settings, *, depth=0, progress_cb=None, display_name="", label_prefix=""):
     """
     يستخرج نص كل جزء من أجزاء الصورة المقطوعة ثم يدمجها.
     يرفع استثناءً إذا فشل أي جزء فشلاً تقنيًا (ليُعاد للصفحة في مرحلة الإنقاذ).
-    الجزء الذي يجيب المزوّد فيه (No) يُقبل كمنطقة فارغة بعد محاولة تدقيق واحدة.
+    الجزء القصير الذي يجيب المزوّد فيه (No) يُقبل كمنطقة فارغة مشروعة بعد تدقيق الإعادة —
+    أما الجزء الذي ما زال طويلًا فلا يُوثق ردّه (No) لأن الصورة مضغوطة: يُعاد تقسيمه وحده.
     """
     texts = []
     last_error = None
-    for tile_bytes, tile_label in tiles:
+    total = len(tiles)
+    for t_idx, (tile_bytes, tile_label, tile_height) in enumerate(tiles, start=1):
+        shown_label = f"{label_prefix}{tile_label}"
+        if progress_cb and display_name:
+            try:
+                progress_cb(
+                    "split_sub" if depth > 0 else "split_tile",
+                    display_name, t_idx, total, shown_label,
+                )
+            except Exception:
+                pass
         accepted = False
         for attempt in range(1, TILE_MAX_RETRIES + 1):
             chat_id = None
             try:
                 raw, chat_id = _do_single_extraction(
-                    user_id, tile_bytes, tile_label, thinking_enabled, settings, None,
+                    user_id, tile_bytes, shown_label, thinking_enabled, settings, None,
                     retry_hint=attempt >= 2,
                 )
                 cleaned = _sanitize_extraction(raw)
                 if cleaned == _EXTRACTION_FAILED_MARKER:
-                    # جزء بلا نص فعلاً (بعد تدقيق الإعادة) — منطقة فارغة مشروعة
+                    # (No) على جزء ما زال طويلًا لا يُصدَّق — تقسيم فرعي للجزء وحده
+                    if tile_height > TILE_MAX_EDGE:
+                        sub_text = _sub_split_tile(
+                            user_id, tile_bytes, shown_label, thinking_enabled,
+                            settings, depth, progress_cb, display_name,
+                        )
+                        if sub_text is not None:
+                            texts.append(sub_text)
+                            accepted = True
+                            break
+                    # جزء قصير أعلن (No)؟ لا يُقبل من المحاولة الأولى — تدقيق إعادة
+                    # بتلميح أعمق أولًا حمايةً من إعلان كاذب، ثم يُقبل كمنطقة فارغة مشروعة
+                    if attempt < TILE_MAX_RETRIES:
+                        continue
                     texts.append("")
                     accepted = True
                     break
@@ -1625,34 +1685,44 @@ def _extract_tiled(user_id, tiles, thinking_enabled, settings):
             finally:
                 _delete_chat_quiet(user_id, chat_id)
         if not accepted:
-            raise last_error or Exception(f"تعذّرت قراءة جزء من الصورة ({tile_label}).")
+            # فشل تقني متكرر في جزء ما زال طويلًا؟ تقسيم فرعي أخير قبل الاستسلام
+            if tile_height > TILE_MAX_EDGE:
+                sub_text = _sub_split_tile(
+                    user_id, tile_bytes, shown_label, thinking_enabled,
+                    settings, depth, progress_cb, display_name,
+                )
+                if sub_text is not None and sub_text.strip():
+                    texts.append(sub_text)
+                    continue
+            raise last_error or Exception(f"تعذّرت قراءة جزء من الصورة ({shown_label}).")
     return _merge_tile_texts(texts)
 
 
-def extract_text_from_single_image(user_id, image_bytes, image_name, thinking_enabled, settings=None, chat_id=None):
+def extract_text_from_single_image(user_id, image_bytes, image_name, thinking_enabled, settings=None, chat_id=None, progress_cb=None):
     """
     استخراج كامل الدورة لصورة واحدة:
-    1) محاولات على الصورة كاملة.
-    2) الصور الشريطية الطويلة: في وضع الدقة الكاملة تُقطع فورًا، وفي وضع السرعة
-       يُقطعون كخطة بديلة فقط عند فشل الصورة كاملة أو إعلان (No) عليها.
+    1) الصورة تُجرّب كاملة أولًا دائمًا في الوضعين — لا تقسيم استباقي أبدًا.
+    2) فقط إذا فشلت الصورة الطويلة بسبب طولها (خطأ تقني أو إعلان No غير قابل للتصديق)
+       تُقسّم إلى حد أقصى TILE_MAX_PARTS أجزاء ويُدمج نصها.
     3) الفشل التقني الحقيقي يرفع استثناءً ليستلمه خط الأنابيب في مرحلة الإنقاذ.
+    4) كل ناتج ناجح يمرّ على المراجعة الآلية لترجمة أي مقاطع أجنبية متبقية.
+    progress_cb: دالة اختيارية (stage, name, part, total, label) لتحديث مؤشر الانتظار
+    بأمان من داخل خيوط المعالجة.
     """
-    chat_id_used = None
     last_error = None
 
-    # وضع الدقة الكاملة مع شريط طويل → التقسيم مباشرة هو الخيار الأدق
-    if thinking_enabled:
-        try:
-            tiles = split_long_image(image_bytes)
-        except Exception:
-            tiles = []
-        if len(tiles) > 1:
-            merged = _extract_tiled(user_id, tiles, thinking_enabled, settings)
-            if merged.strip():
-                return merged
-            return ""
-    else:
-        tiles = None
+    def finish(result):
+        if (result or "").strip():
+            return _review_foreign_text(user_id, result)
+        return result or ""
+
+    # هل الصورة شريطًا طويلًا؟ (فقط الطويلة هي المرشحة للتقسيم عند الفشل)
+    long_image = False
+    try:
+        _, img_height = get_image_dimensions(image_bytes)
+        long_image = img_height > TILE_MAX_EDGE
+    except Exception:
+        long_image = False
 
     for attempt in range(1, MAX_RETRY_PER_IMAGE + 1):
         chat_id_used = None
@@ -1663,8 +1733,12 @@ def extract_text_from_single_image(user_id, image_bytes, image_name, thinking_en
             )
             cleaned = _sanitize_extraction(raw)
             if cleaned != _EXTRACTION_FAILED_MARKER:
-                return cleaned
+                return finish(cleaned)
             last_error = None  # إعلان (No) موثّق — ليس خطأ تقنيًا
+            if long_image:
+                # صورة طويلة أُعلن (No) عليها؟ الرد غير قابل للوثيق لأن الصورة
+                # تُضغط بعنف — انتقال مباشر للتقسيم بدل حرق المحاولات عبثًا.
+                break
         except Exception as exc:
             last_error = exc
         finally:
@@ -1673,22 +1747,154 @@ def extract_text_from_single_image(user_id, image_bytes, image_name, thinking_en
             time.sleep(2 * attempt)
             chat_id = None
 
-    # خطة التقسيم الذكي — الشريط الطويل الذي فشل كاملًا أو أُعلن (No) عليه
-    if tiles is None:
+    # خطة التقسيم الذكي — فقط للصور الطويلة التي فشلت فعلاً (في الوضعين)
+    if long_image:
+        if progress_cb:
+            try:
+                progress_cb("split_start", image_name, 0, 0, "")
+            except Exception:
+                pass
         try:
             tiles = split_long_image(image_bytes)
         except Exception:
             tiles = []
-    if len(tiles) > 1:
-        merged = _extract_tiled(user_id, tiles, True, settings)
-        if merged.strip():
-            return merged
-        # حتى مع التقسيم: لا نص إطلاقًا — صورة فارغة مؤكدة
-        return ""
+        if len(tiles) > 1:
+            merged = _extract_tiled(
+                user_id, tiles, True, settings,
+                progress_cb=progress_cb, display_name=image_name,
+            )
+            if merged.strip():
+                return finish(merged)
+            # حتى مع التقسيم: لا نص إطلاقًا — صورة فارغة مؤكدة
+            return ""
 
     if last_error is not None:
         raise last_error
     return ""
+
+
+# ============================================================
+# المراجعة الآلية — ترجمة المقاطع الأجنبية المتبقية في نص الاستخراج
+# أحيانًا يسلّب الاستخراج كلمات أو حروفًا إنجليزية/كورية/صينية —
+# تُكتشف آليًا، تُترجم، ثم يُلصق الناتج مكانها بدقة دون المساس بأي شيء آخر.
+# حروف التصنيف مثل A, S, SS, C تُستثنى — فهي صحيحة كما هي.
+# ============================================================
+_FOREIGN_RANK_TOKEN_RE = re.compile(r"^[A-FS]{1,3}$")
+# عبارة لاتينية متصلة (كلمات متتابعة بمسافات تُترجم معًا كجملة واحدة) مع علامات الترقيم الختامية
+# حتى لا تبقى علامة استفهام/تعجب يتيمة بعد الترجمة (مثل: ؟?)
+_FOREIGN_LATIN_RE = re.compile(r"[A-Za-z][A-Za-z'’\-]*(?:[ \t]+[A-Za-z][A-Za-z'’\-]*)*[?!,.;:؟]*")
+# مسار متصل من الحروف الآسيوية (كورية/صينية/يابانية) مع مسافاتها الداخلية
+_FOREIGN_ASIAN_RE = re.compile(
+    "[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\uAC00-\uD7A3\u3130-\u318F\u1100-\u11FF]"
+    "(?:[ \t]*[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\uAC00-\uD7A3\u3130-\u318F\u1100-\u11FF])*"
+)
+_FOREIGN_REVIEW_MAX_SNIPPETS = 80
+
+
+_FOREIGN_RANK_STRIP = "?!,.;:؟*"
+
+
+def _is_rank_letters(phrase):
+    """هل العبارة اللاتينية كلها حروف تصنيف (A, S, SS, C...)؟ هذه تبقى كما هي."""
+    tokens = [t.strip(_FOREIGN_RANK_STRIP) for t in phrase.split()]
+    return bool(tokens) and all(t and _FOREIGN_RANK_TOKEN_RE.match(t) for t in tokens)
+
+
+def _collect_foreign_segments(text):
+    """
+    يجمع المقاطع الأجنبية الفريدة (إنجليزية/كورية/صينية/يابانية) من نص مستخرج.
+    - حروف التصنيف المفردة/المزدوجة بأحرف كبيرة (A, S, SS, C...) تبقى كما هي.
+    - فاصل الصفحات (## name) لا يُمس أبدًا.
+    يعيد قائمة {"text", "line"} بلا تكرار.
+    """
+    segments = []
+    seen = set()
+    for line_txt in (text or "").splitlines():
+        if not line_txt.strip() or line_txt.strip().startswith("## "):
+            continue
+        found = []
+        for m in _FOREIGN_LATIN_RE.finditer(line_txt):
+            if _is_rank_letters(m.group()):
+                continue  # حروف تصنيف — تبقى كما هي
+            found.append(m.group())
+        for m in _FOREIGN_ASIAN_RE.finditer(line_txt):
+            found.append(m.group())
+        for seg in found:
+            seg = seg.strip()
+            if not seg:
+                continue
+            key = seg.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            segments.append({"text": seg, "line": line_txt.strip()})
+    return segments
+
+
+def _review_foreign_text(user_id, text):
+    """
+    المراجعة الآلية لنتيجة الاستخراج:
+    إذا بقي في النص أي مقطع أجنبي يُرسل مع سياقه للترجمة، ثم يُلصق الناتج مكانه.
+    أي خلل في المراجعة يعيد النص الأصلي كما هو — لا يفسد النص أبدًا.
+    """
+    if not FOREIGN_REVIEW_ENABLED or not (text or "").strip():
+        return text or ""
+    try:
+        segments = _collect_foreign_segments(text)
+        if not segments:
+            return text
+        if len(segments) > _FOREIGN_REVIEW_MAX_SNIPPETS:
+            segments = segments[:_FOREIGN_REVIEW_MAX_SNIPPETS]
+        payload = [
+            {"id": str(i + 1), "text": seg["text"], "context": seg["line"][:200]}
+            for i, seg in enumerate(segments)
+        ]
+        prompt = (
+            "You are a precise post-editing assistant for Arabic manhwa dialogue.\n"
+            "The extracted text was supposed to be fully Arabic, but a few foreign "
+            "fragments (English, Korean, Chinese or Japanese) were left inside it.\n"
+            "You will receive a JSON array of these fragments; each fragment has the "
+            "line it appeared in as context.\n"
+            "Translate every fragment into natural, fluent Arabic that fits its "
+            "context — concise manhwa dialogue style, exactly as it should read in place.\n"
+            "Return ONLY a strict JSON object mapping each id to its Arabic translation, "
+            'like {"1": "...", "2": "..."} — no commentary, no code fences, no extra keys.\n\n'
+            "FRAGMENTS:\n" + json.dumps(payload, ensure_ascii=False)
+        )
+        raw = request_qwen_text_completion(
+            user_id, prompt, service_type="chat", max_attempts=2, thinking_enabled=False,
+        )
+        data = json.loads(_strip_code_fences(raw))
+        translations = {}
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if isinstance(value, str) and value.strip():
+                    translations[str(key).strip()] = value.strip()
+        elif isinstance(data, list):
+            for item in data:
+                if (
+                    isinstance(item, dict)
+                    and item.get("id") is not None
+                    and isinstance(item.get("ar"), str)
+                    and item["ar"].strip()
+                ):
+                    translations[str(item["id"]).strip()] = item["ar"].strip()
+        if not translations:
+            return text
+        result = text
+        # الأطول أولًا حتى لا يفسد مقطع قصير جزءًا من مقطع أطول
+        indexed = sorted(enumerate(segments), key=lambda kv: len(kv[1]["text"]), reverse=True)
+        for i, seg in indexed:
+            translated = translations.get(str(i + 1), "")
+            original = seg["text"]
+            if not translated or translated.lower() == original.lower():
+                continue
+            if len(translated) > max(40, len(original) * 4 + 20):
+                continue  # حماية من هلوسة تضخّم النص
+            result = result.replace(original, translated)
+        return result
+    except Exception:
+        return text  # أي خلل لا يفسد النص الأصلي أبدًا
 
 
 # ============================================================
@@ -1928,6 +2134,41 @@ async def resolve_and_consume_point(user_id: int, guild_id) -> tuple:
     return ok, profile_after, "user"
 
 
+async def _push_split_status(status_msg, stage, name, part, total_parts, label, current, total):
+    """رسائل مرحلة التقسيم الذكي في مؤشر الانتظار (تُستدعى بأمان من خيوط المعالجة)."""
+    try:
+        if stage == "split_start":
+            await edit_status(
+                status_msg,
+                "{emoji:alerttriangle} فشل استخراج صورة لكبر حجمها",
+                f"الصفحة `{name}` أطول من أن تُقرأ كاملة — جاري تقسيمها إلى أجزاء قابلة للقراءة.",
+                current=current, total=total,
+            )
+        elif stage == "split_tile":
+            await edit_status(
+                status_msg,
+                "{emoji:photo} استخراج صفحة مقسّمة",
+                f"الصفحة `{name}` — جاري استخراج الجزء `{part}` من `{total_parts}`.",
+                current=current, total=total,
+            )
+        elif stage == "sub_split_start":
+            await edit_status(
+                status_msg,
+                "{emoji:alerttriangle} جزء عملاق يحتاج تقسيمًا إضافيًا",
+                f"الصفحة `{name}` — الجزء `{label}` ما زال طويلًا، جاري تقسيمه وحده.",
+                current=current, total=total,
+            )
+        elif stage == "split_sub":
+            await edit_status(
+                status_msg,
+                "{emoji:photo} استخراج صفحة مقسّمة",
+                f"الصفحة `{name}` — جاري استخراج الجزء الفرعي `{label}` (`{part}` من `{total_parts}`).",
+                current=current, total=total,
+            )
+    except Exception:
+        pass
+
+
 # ============================================================
 # خط أنابيب استخراج الصفحات — نظام محاولات مزدوج للصفحات المتعثرة
 # ============================================================
@@ -1946,6 +2187,14 @@ async def run_extraction_pipeline(status_msg, user_id, images, thinking_enabled,
     completed = 0
     progress_lock = asyncio.Lock()
     semaphore = asyncio.Semaphore(max(1, EXTRACTION_CONCURRENCY))
+    loop = asyncio.get_running_loop()
+
+    def thread_progress(stage, name, part=0, total_parts=0, label=""):
+        """يحوّل تحديثات مراحل التقسيم من خيوط المعالجة إلى مؤشر الانتظار بأمان."""
+        asyncio.run_coroutine_threadsafe(
+            _push_split_status(status_msg, stage, name, part, total_parts, label, completed, total_images),
+            loop,
+        )
 
     async def worker(idx: int, img_bytes: bytes, img_name: str):
         nonlocal completed
@@ -1958,6 +2207,7 @@ async def run_extraction_pipeline(status_msg, user_id, images, thinking_enabled,
                     img_name,
                     thinking_enabled,
                     settings,
+                    progress_cb=thread_progress,
                 )
             except Exception as e:
                 page_texts[idx] = None
@@ -1999,6 +2249,7 @@ async def run_extraction_pipeline(status_msg, user_id, images, thinking_enabled,
                     img_name,
                     True,  # وضع الدقة الكاملة في المحاولة الأخيرة
                     settings,
+                    progress_cb=thread_progress,
                 )
             except Exception:
                 page_texts[idx] = None
@@ -2837,18 +3088,21 @@ def help_sections():
             "> • ملف `ZIP` داخله صور الفصل مرتبة الأسماء.\n"
             "> • رابط `Google Drive` لمجلد أو ملف — وسيقرأ حتى `1000` صورة.\n"
             "> {emoji:num_3} تظهر **لوحة حالة حية** والصفحات تُعالج **بالتوازي** لتقصير المدة — "
-            "وإذا تعذّرت قراءة صفحة سيحاول البوت **إعادة المحاولة تلقائيًا** قبل الاستسلام.\n"
+            "وإذا تعذّرت قراءة صفحة سيحاول البوت **إعادة المحاولة تلقائيًا** قبل الاستسلام، "
+            "ويخضع الناتج ل**مراجعة آلية** تترجم أي مقاطع أجنبية متبقية وتلصقها مكانها (مع إبقاء حروف التصنيف مثل `A` `S` `SS` `C` كما هي).\n"
             "> {emoji:num_4} تصلك لوحة النتيجة: الملف داخلها مباشرة + **تقرير جودة** (الصور الفارغة، المدة، الصيغة).\n"
             "> **ملاحظات:** النص يُرتّب حسب أسماء الصور (مرّتها = مرتب الناتج)، ويُفصل كل صفحة بسطر `## اسم الصورة`."
         ),
-        "## {emoji:zap} الصفحات الشريطية الطويلة — التقسيم الذكي",
+        "## {emoji:zap} الصفحات الشريطية الطويلة — تقسيم عند الحاجة فقط",
         (
             "> كثير من فصول المانهوا تُدمج عموديًا في صورة واحدة بالغة الارتفاع، "
-            "وهذا يجعل النص **غير مقروء** للأنظمة البصرية مهما كانت جودتها لأن الصورة تُضغط بعنف.\n"
-            "> البوت يكشف هذه الصور ويقسّمها **تلقائيًا** إلى مقاطع متداخلة قابلة للقراءة، "
-            "ثم يدمج النص ويُزيل أي تكرار عند حدود المقاطع — "
-            "فصفحتك تخرج كاملة النص تحت اسمها الأصلي دون أي تدخل منك.\n"
-            "> في وضع **دقة كاملة** يحدث التقسيم فورًا لأقصى دقة، وفي وضع **سرعة عالية** يُستخدم كخطة إنقاذ ذكية عند الحاجة فقط."
+            "وهذا يجعل النص **غير مقروء** لأن الصورة تُضغط بعنف مهما كانت جودتها.\n"
+            "> لا يوجد أي تقسيم في الوضع الطبيعي — الصفحة تُقرأ **كاملة أولًا** دائمًا، "
+            "وفقط إذا فشلت صفحة **لكبر حجمها** يبدأ التقسيم تلقائيًا بحد أقصى **3 أجزاء** للصفحة كلها، "
+            "مع دمج ذكي يُزيل أي تكرار عند الحدود وتحديد دقيق لما فشل بالضبط.\n"
+            "> ستشاهد في مؤشر الانتظار رسالة واضحة مثل: **فشل استخراج صورة لكبر حجمها — جاري تقسيمها** "
+            "ثم تقدم كل جزء (الجزء `1` من `3`...).\n"
+            "> وإذا كان أحد الأجزاء نفسه أطول من اللازم يُعاد تقسيمه **وحده** — ضمان إضافي نادر للصفحات العملاقة."
         ),
         "## {emoji:message} الأمر `/translate` — ترجمة فصل جاهز",
         (
