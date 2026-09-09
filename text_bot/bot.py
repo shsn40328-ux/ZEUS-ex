@@ -183,11 +183,25 @@ def status_embed(title, description, *, error=False):
 
 def output_separator(settings, idx, image_name):
     """
-    فاصل الصفحات داخل الملف — اسم الصورة الأصلية فقط على سطر مستقل،
-    بلا أي تنسيق ماركدون (لا ## ولا خطوط ---).
+    فاصل الصفحات داخل الملف — الشكل الرسمي الذي طلبه المستخدم:
+    ---
+
+
+    001.png
+
+
+    ---
+    أي: سطر «---» ثم سطران فارغان ثم اسم الصورة الأصلية ثم سطران فارغان ثم سطر «---».
+    لا يُستخدم أي ماركدون آخر (لا ## ولا ** ولا `) — الشرطات الثلاث جزء من الفاصل نفسه.
     """
     safe_name = Path(image_name or f"صورة {idx}").name
-    return f"\n\n{safe_name}\n\n"
+    return f"\n\n---\n\n\n{safe_name}\n\n\n---\n\n"
+
+
+def separator_frame(image_name):
+    """الكتلة الرسمية لفاصل صفحة (داخل نص مُهيّأ بالفعل — بلا أسطر زائدة قبلها)."""
+    safe_name = Path(image_name or "").name or "صورة"
+    return f"---\n\n\n{safe_name}\n\n\n---"
 
 
 # امتدادات الصور — تُستخدم للتعرف على أسطر فواصل الصفحات (اسم الصورة المجرد)
@@ -197,8 +211,9 @@ _SEPARATOR_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
 def _separator_name_from_line(line_txt):
     """
     يستخرج اسم صفحة من سطر فاصل إن كان السطر فاصلًا فعلاً، وإلا None.
-    يدعم الصيغة الحالية (اسم الصورة المجرد على سطر مستقل) والصيغة القديمة
-    (## name) لأي نصوص قديمة — الفقاعات الحوارية لا تطابق هذين النمطين.
+    يدعم الصيغة الرسمية الحالية (اسم الصورة المجرد على سطر مستقل داخل إطار
+    «---» — أسطر الشرطات تُنظّف في مكان آخر والاسم يبقى سطرًا مستقلًا)
+    والصيغة القديمة (## name) لأي نصوص قديمة — الفقاعات الحوارية لا تطابق هذين النمطين.
     """
     s = (line_txt or "").strip()
     if not s:
@@ -875,6 +890,46 @@ def _literary_style_block(lang):
     )
 
 
+def _human_precision_block(lang):
+    """
+    قواعد الدقة البشرية — أعلى أولوية: ربط كل ضمير بشخصيته الفعلية، وتحديد
+    جنس المتحدث والمخاطب وحالة العدد من الصورة/السياق، ونسبة كل فقاعة
+    لقائلها الحقيقي، وصياغة تشبه المترجم البشري المحترف لا الترجمة الحرفية.
+    مشتركة بين المسارين (من الصور ومن النص) وفي الوضعين (السرعة والدقة).
+    """
+    return (
+        "PRONOUN ANCHORING & CONTEXT — HUMAN PRECISION (THE HIGHEST PRIORITY):\n"
+        "- You are translating ONE continuing conversation, not isolated lines. Read "
+        "everything (including any context tail) as a single flowing story BEFORE "
+        "writing, and keep every character, name and relationship consistent across "
+        "the whole chapter.\n"
+        "- Resolve EVERY pronoun to the actual person it refers to, then express that "
+        "resolution naturally in " + lang + ". If a line is about a female character "
+        "discussed earlier in the conversation, the translation must be about HER — "
+        "for example «إنها تثير في نفسي القشعريرة» (her behaviour chills ME) — never "
+        "a detached masculine «إنه أمر يثير القشعريرة» that erases her.\n"
+        "- Conjugate every verb, adjective and imperative to the REAL gender of the "
+        "speaker and of the addressee as seen in the scene: feminine forms like "
+        "أترغبين / خُذي / فلتمسكي / عليكِ أن تكوني مضحكة when addressing a girl, and "
+        "masculine forms when addressing a boy. A wrong gender is a mistranslation.\n"
+        "- Count the actual people being addressed: singular stays singular, plural "
+        "stays plural. NEVER invent the dual form (أتريدان) unless two people are truly "
+        "addressed together.\n"
+        "- Attribute every bubble to its true speaker as drawn in the panel: a reply "
+        "like «you're not a thug» is said ABOUT the other person — translate it as "
+        "«أنتِ لستِ بلطجية», never as a first-person denial «لستُ فردًا من عصابة».\n"
+        "- Render personal feelings from the speaker's own viewpoint when the original "
+        "implies it — «تثير في نفسي…», «يا لَسعادتك… لديكَ كلّ هؤلاء الأصدقاء» — "
+        "instead of an abstract third-person report like «لا بد أنه أمر رائع أن يكون "
+        "للمرء…».\n"
+        "- Choose the idiomatic phrasing a professional human localizer would pick — "
+        "«ما بالُ هان سي ريم؟» not «ما شأن هان سيريم؟», «في هامش الشهرة» not «تافهون "
+        "جدا», «معهد التقوية» for a cram school, «الأوبا المفضلين لديك» for oppas, "
+        "«موعد غرامي مدبَّر» for an arranged blind date — always inside formal "
+        "literary standard " + lang + "."
+    )
+
+
 def _register_block(lang):
     """قواعد الفصحى الأدبية ومنع العامية والحركات — مشتركة بين المسارين، مطبقة في الوضعين."""
     return (
@@ -914,14 +969,19 @@ def build_translation_prompt(target_language, *, bubble_spacing=True):
         "breaks that existed inside the original bubble.\n"
         "3. Keep EXACTLY the same number of bubbles, in EXACTLY the same order as "
         "the input. One input line becomes exactly one output line.\n"
-        "4. Lines that are just an image filename (for example `page-01.jpg`) are "
-        "page separators — they are NOT dialogue. Copy each separator EXACTLY as "
-        "it is, character for character, on its own line, without translating or "
-        "altering it.\n"
+        "4. PAGE SEPARATORS — EXACT BLOCK: a line that is just an image filename "
+        "(for example `001.png`), wrapped between lines of three dashes, is a page "
+        "separator — NOT dialogue. Reproduce EVERY separator in exactly this block "
+        "shape, character for character (three dashes, two empty lines, the unchanged "
+        "filename, two empty lines, three dashes):\n"
+        "---\n\n\n001.png\n\n\n---\n"
+        "The `---` lines belong ONLY to these separator blocks and must never appear "
+        "anywhere else.\n"
         f"5. {spacing_rule}\n"
         "6. PLAIN TEXT ONLY — NO MARKDOWN anywhere: never use `#` headings, "
-        "`---` horizontal rules, `**bold**`, `*italic*`, `__underline__` or "
-        "backticks in your output. Dialogue and separators are plain text.\n"
+        "`**bold**`, `*italic*`, `__underline__` or backticks in your output. The "
+        "ONLY dashes allowed are the three-dash lines of the page separator blocks "
+        "described in rule 4 — nothing else.\n"
         "7. START DIRECTLY WITH THE TRANSLATION ITSELF: the very first line of "
         "your reply must be a page separator or a translated bubble. NEVER write "
         "any introduction or preamble such as «Here is the translation», "
@@ -929,6 +989,7 @@ def build_translation_prompt(target_language, *, bubble_spacing=True):
         "notes or offers of help. Output ONLY the translated pages and nothing "
         "else, so the result reads like a human-made release.\n\n"
         + _literary_style_block(lang) + "\n\n"
+        + _human_precision_block(lang) + "\n\n"
         + _register_block(lang)
     )
 
@@ -984,10 +1045,13 @@ def build_vision_translation_prompt(target_language, image_names, *, total_batch
         "IMAGE ORDER — ABSOLUTE:\n" + "\n".join(order_lines) + "\n"
         "Read the images strictly in this order and NEVER mix content between them.",
         "OUTPUT FORMAT — MANDATORY:\n"
-        "1. Each page's section starts with its SEPARATOR LINE: the page's filename "
-        "alone on its own line. Copy each filename EXACTLY as written below, "
-        "character for character — it is NOT dialogue and must not be translated:\n"
-        + "\n".join(image_names) + "\n"
+        "1. Each page's section starts with its SEPARATOR BLOCK in exactly this "
+        "shape — a line with three dashes, two empty lines, the page's filename "
+        "copied EXACTLY as written below (character for character, it is NOT "
+        "dialogue and must not be translated), then two empty lines, then a line "
+        "with three dashes:\n"
+        "---\n\n\n" + image_names[0] + "\n\n\n---\n"
+        "Filenames for this batch, in order:\n" + "\n".join(image_names) + "\n"
         "2. ONE BUBBLE = ONE LINE: every speech bubble's translation is a SINGLE "
         "line, no matter how long it is. Even if the text inside a bubble is "
         "visually wrapped over two or three lines in the image, JOIN it and output "
@@ -995,14 +1059,15 @@ def build_vision_translation_prompt(target_language, image_names, *, total_batch
         "and NEVER split one bubble's translation across multiple lines. Never "
         "merge two different bubbles into one line.\n"
         f"3. {spacing_rule}\n"
-        "4. The separators must appear in the SAME order as the images, each "
+        "4. The separator blocks must appear in the SAME order as the images, each "
         "followed by its own page's translation only.\n"
-        "5. A page with no readable dialogue: output its separator line followed "
+        "5. A page with no readable dialogue: output its separator block followed "
         "by nothing.\n"
         "6. " + sfx_line + "\n"
         "7. PLAIN TEXT ONLY — NO MARKDOWN anywhere: never use `#` headings, "
-        "`---` horizontal rules, `**bold**`, `*italic*`, `__underline__` or "
-        "backticks. The separator is the bare filename, nothing else.\n"
+        "`**bold**`, `*italic*`, `__underline__` or backticks. The ONLY dashes "
+        "allowed are the three-dash lines of the page separator blocks described "
+        "in rule 1 — never use dashes as decorative rules anywhere else.\n"
         "8. START DIRECTLY WITH THE TRANSLATION ITSELF: the very first line of "
         "your reply must be the first page's separator line. NEVER write any "
         "introduction or preamble such as «Here is the translation», "
@@ -1010,6 +1075,7 @@ def build_vision_translation_prompt(target_language, image_names, *, total_batch
         "notes or offers of help. Output ONLY the translated pages and nothing "
         "else, so the result reads like a human-made release.",
         _literary_style_block(lang),
+        _human_precision_block(lang),
         _register_block(lang),
     ]
     if total_batches > 1:
@@ -1048,10 +1114,15 @@ SPEED_MODE_REMINDER = (
     "Formal literary standard language ONLY — strictly no colloquial dialects, "
     "no slang, no street speech. And strictly NO diacritics/vowel marks "
     "(تشكيل/حركات) except absolute necessity. "
+    "PRONOUNS: resolve every pronoun to its real person — match the gender of "
+    "the speaker and the addressee exactly, keep singular/plural as drawn, and "
+    "link references to characters mentioned earlier in the conversation.\n"
     "FORMAT: one bubble = one single line, blank line between bubbles, plain text "
-    "with no Markdown, and your reply must START directly with the first page's "
-    "separator line — never open with «Here is the translation» / «إليك الترجمة» "
-    "or any other preamble or closing remarks."
+    "with no Markdown except the official page separator block (a `---` line, two "
+    "empty lines, the unchanged filename, two empty lines, a `---` line), and your "
+    "reply must START directly with the first page's separator block — never open "
+    "with «Here is the translation» / «إليك الترجمة» or any other preamble or "
+    "closing remarks."
 )
 
 
@@ -1242,11 +1313,12 @@ def _finalize_translation_format(text, *, bubble_spacing=True, image_names=None)
     التهيئة النهائية الحتمية لنص الترجمة قبل كتابته في الملف — تطبيق صارم لصيغة
     «الإصدار المنشور» في كل الأحوال مهما أخطأ المزوّد:
     1) أي مقدمة قبل أول فاصل صفحة تُحذف (إليك الترجمة... إلخ).
-    2) كل فاصل صفحة يطبع اسم الصورة المجرد فقط، بسطر فارغ قبله وبعده.
+    2) كل فاصل صفحة يُطبع بالكتلة الرسمية: --- سطران فارغان اسم الصورة سطران فارغان ---.
     3) كل فقاعة سطر واحد كامل: الفقاعات المفصولة بسطر فارغ تُدمج أسطرها الداخلية
        في سطر واحد؛ ولا يُدمج أبدًا ما بينهما.
     4) سطر فارغ واحد بين الفقاعات (أو نص متصل عندما يعطّل المستخدم المسافات).
-    5) لا ماركدون إطلاقًا: لا # ولا --- ولا ** ولا ` — تُنظف من كل سطر.
+    5) لا ماركدون إطلاقًا: لا # ولا ** ولا ` — تُنظف من كل سطر؛ أسطر الشرطات
+       الوحيدة المسموحة هي إطار الفاصل الرسمي الذي يُعاد بناؤه آليًا هنا.
     """
     raw = (text or "").replace("\r\n", "\n").replace("\r", "\n")
     lines = raw.split("\n")
@@ -1327,9 +1399,9 @@ def _finalize_translation_format(text, *, bubble_spacing=True, image_names=None)
         if name is None:
             out_parts.append(body)
         elif not body:
-            out_parts.append(name)
+            out_parts.append(separator_frame(name))
         else:
-            out_parts.append(f"{name}\n{body}" if not bubble_spacing else f"{name}\n\n{body}")
+            out_parts.append(f"{separator_frame(name)}\n\n{body}")
 
     final = "\n\n".join(p for p in out_parts if p and p.strip())
     return final.strip()
@@ -1367,10 +1439,14 @@ def _split_translation_chunks(chapter_text, max_lines=None, max_chars=None):
         return []
     lines = text.split("\n")
 
-    # تجميع السطور في كتل — كل فاصل صفحة يبدأ كتلة جديدة
+    # تجميع السطور في كتل — كل فاصل صفحة يبدأ كتلة جديدة،
+    # وأسطر الشرطات (إطار الفاصل) تُستبعد من مدخل الترجمة —
+    # تُعاد بناؤها آليًا بالكتلة الرسمية في التهيئة النهائية.
     blocks = []
     current = []
     for ln in lines:
+        if _MARKDOWN_RULE_LINE_RE.match(ln.strip()):
+            continue
         if _separator_name_from_line(ln) and current:
             blocks.append(current)
             current = [ln]
@@ -1427,7 +1503,8 @@ def translate_chapter_text(user_id, chapter_text, settings, *, thinking_enabled=
     1) حذف أي مقدمة قبل الترجمة (مثل «إليك الترجمة») — الناتج صفحات فقط.
     2) مراجعة المقاطع الأجنبية المتبقية — تُترجم وتُلصق مكانها (حروف التصنيف محمية).
     3) شبكة أمان الحركات + التهيئة النهائية: فقاعة = سطر واحد، سطر فارغ بين
-       الفقاعات، وبلا أي ماركدون — الفاصل اسم الصورة المجرد.
+       الفقاعات، وبلا أي ماركدون — والفاصل بالكتلة الرسمية
+       (--- سطران فارغان اسم الصورة سطران فارغان ---).
     """
     target = (settings or {}).get("translate_target", "ar")
     bubble_spacing = bool((settings or {}).get("bubble_spacing", True))
@@ -1529,7 +1606,8 @@ def vision_translate_chapter(user_id, images, settings, *, thinking_enabled=Fals
     - الفصحى الأدبية ومنع العامية والحركات والمراجعة الآلية مطبقة كما في المسار النصي
       وفي الوضعين (السرعة والدقة).
     - الناتج النهائي يمر بالتهيئة الحتمية: بلا مقدمات، فقاعة = سطر واحد،
-      سطر فارغ بين الفقاعات، وبلا أي ماركدون.
+      سطر فارغ بين الفقاعات، وبلا أي ماركدون — والفاصل بالكتلة الرسمية
+      (--- سطران فارغان اسم الصورة سطران فارغان ---).
     - عند فشل دفعة بعد المحاولات: خطة بديلة — ترجمة نصية من نص استخراج صفحاتها
       إن توفر (extracted_texts)، وإلا فشلت الترجمة صراحة.
     """
@@ -1600,7 +1678,10 @@ def vision_translate_chapter(user_id, images, settings, *, thinking_enabled=Fals
                 page_text = (extracted_texts.get(name) or "").strip()
                 if page_text and page_text != _EXTRACTION_FAILED_MARKER:
                     has_content = True
-                fallback_parts.append(output_separator({}, p_idx, name) + page_text)
+                    fallback_parts.append(output_separator({}, p_idx, name) + page_text)
+                else:
+                    # صفحة بلا نص صالح — فاصلها فقط، ولا يتسرب أي وسم داخلي للترجمة
+                    fallback_parts.append(output_separator({}, p_idx, name))
             if not has_content:
                 # صفحات الدفعة بلا نص مستخرج فعلاً — لا داعي لاستدعاء إضافي
                 outputs.append("".join(fallback_parts).strip())
@@ -3315,7 +3396,7 @@ async def run_extraction_pipeline(status_msg, user_id, images, thinking_enabled,
         if not (text or "").strip():
             empty_images += 1
         combined_text += output_separator(settings, idx, img_name) + (text or "")
-    return combined_text, empty_images, failed_pages, page_texts_by_name
+    return combined_text.strip(), empty_images, failed_pages, page_texts_by_name
 
 
 # ============================================================
