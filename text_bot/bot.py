@@ -33,7 +33,7 @@ BOT_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "656783724662226963"))
 TEMP_API_URL = os.getenv("TEMP_API_URL", "").rstrip("/")
 BASE_QWEN_URL = os.getenv("BASE_QWEN_URL", "https://chat.qwen.ai/api/v2").rstrip("/")
-BOT_VERSION = os.getenv("BOT_VERSION", "2.6.0")
+BOT_VERSION = os.getenv("BOT_VERSION", "2.7.0")
 GDRIVE_API_KEY = os.getenv("GDRIVE_API_KEY", "").strip()
 
 MAX_IMAGES_PER_REQUEST = int(os.getenv("MAX_IMAGES_PER_REQUEST", "10"))
@@ -142,7 +142,7 @@ discord.Message.edit = _patched_message_edit
 # ============================================================
 # عرض موحد للرسائل — Emojis + Markdown منسق
 # ============================================================
-RULE = "\n\n---\n\n"
+RULE = "\n\n---\n\n"  # للاستخدام البصري في واجهات ديسكورد فقط — ملفات النص لا تستخدمه
 V2_SUPPORTED = all(hasattr(discord.ui, name) for name in ("LayoutView", "Container", "TextDisplay", "Separator", "File", "ActionRow"))
 V2_SEPARATOR_SUPPORTED = V2_SUPPORTED
 SUPPORT_SERVER_URL = os.getenv("SUPPORT_SERVER_URL", "").strip()
@@ -182,9 +182,32 @@ def status_embed(title, description, *, error=False):
 
 
 def output_separator(settings, idx, image_name):
-    """فاصل الصفحات داخل الملف — ثابت دائمًا على اسم الصورة الأصلية."""
+    """
+    فاصل الصفحات داخل الملف — اسم الصورة الأصلية فقط على سطر مستقل،
+    بلا أي تنسيق ماركدون (لا ## ولا خطوط ---).
+    """
     safe_name = Path(image_name or f"صورة {idx}").name
-    return f"\n\n{line()}\n## {safe_name}\n{line()}\n\n"
+    return f"\n\n{safe_name}\n\n"
+
+
+# امتدادات الصور — تُستخدم للتعرف على أسطر فواصل الصفحات (اسم الصورة المجرد)
+_SEPARATOR_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
+
+
+def _separator_name_from_line(line_txt):
+    """
+    يستخرج اسم صفحة من سطر فاصل إن كان السطر فاصلًا فعلاً، وإلا None.
+    يدعم الصيغة الحالية (اسم الصورة المجرد على سطر مستقل) والصيغة القديمة
+    (## name) لأي نصوص قديمة — الفقاعات الحوارية لا تطابق هذين النمطين.
+    """
+    s = (line_txt or "").strip()
+    if not s:
+        return None
+    if s.startswith("## "):
+        return s[3:].strip() or None
+    if s.lower().endswith(_SEPARATOR_IMAGE_EXTS):
+        return s
+    return None
 
 
 def format_duration(seconds):
@@ -525,7 +548,7 @@ async def run_chapter_translation_stage(status_msg, user_id, images, page_texts,
 
 async def run_translation_with_status(status_msg, channel, user_id, guild_id, chapter_text,
                                       source_stem, target, output_format, *, thinking_enabled=False,
-                                      images=None, extracted_texts=None):
+                                      images=None, extracted_texts=None, bubble_spacing=True):
     """المنطق المشترك لترجمة فصل جاهز — يُستخدم في /translate و !ترجمة مع دعم وضعي المعالجة.
     عند تمرير images تُترجم الترجمة من الصور نفسها (سياق بصري كامل) بدل النص المُمرر —
     وchapter_text يبقى المسار النصي للملفات الجاهزة TXT/DOCX."""
@@ -558,7 +581,7 @@ async def run_translation_with_status(status_msg, channel, user_id, guild_id, ch
                 vision_translate_chapter,
                 user_id,
                 images,
-                {"translate_target": target},
+                {"translate_target": target, "bubble_spacing": bubble_spacing},
                 thinking_enabled=thinking_enabled,
                 progress_cb=vision_progress,
                 extracted_texts=extracted_texts,
@@ -590,7 +613,7 @@ async def run_translation_with_status(status_msg, channel, user_id, guild_id, ch
                 translate_chapter_text,
                 user_id,
                 chapter_text,
-                {"translate_target": target},
+                {"translate_target": target, "bubble_spacing": bubble_spacing},
                 thinking_enabled=thinking_enabled,
                 progress_cb=progress_cb,
             )
@@ -869,9 +892,14 @@ def _register_block(lang):
     )
 
 
-def build_translation_prompt(target_language):
-    """برومبت ترجمة أدبية احترافية مخصص لفصول المانهوا — كل سطر فقاعة مستقلة."""
+def build_translation_prompt(target_language, *, bubble_spacing=True):
+    """برومبت ترجمة أدبية احترافية مخصص لفصول المانهوا — كل فقاعة سطر واحد مستقل."""
     lang = TRANSLATION_TARGETS.get(target_language, TRANSLATION_TARGETS["ar"])
+    spacing_rule = (
+        "Leave exactly ONE blank line between consecutive speech bubbles."
+        if bubble_spacing
+        else "Do NOT leave blank lines between speech bubbles — output them continuously."
+    )
     return (
         "You are a professional literary translator specialized in manhwa and manga. "
         f"You will receive the extracted text of one complete manhwa chapter. "
@@ -880,28 +908,41 @@ def build_translation_prompt(target_language):
         "CRITICAL FORMAT RULES:\n"
         "1. This is a MANHWA chapter. Every single line of the input is ONE "
         "independent speech bubble. Never try to merge bubbles together.\n"
-        "2. Keep EXACTLY the same number of lines, in EXACTLY the same order as "
-        "the input. One input line becomes one output line.\n"
-        "3. Lines that start with '## ' are image separators (page filenames), "
-        "they are NOT dialogue. Copy them EXACTLY as they are, character for "
-        "character, without translating or altering them.\n"
-        "4. Preserve blank lines exactly as they appear in the input.\n"
-        "5. Output ONLY the translated text. No commentary, no notes, no "
-        "explanations, no headers, no numbering.\n\n"
+        "2. ONE BUBBLE = ONE LINE. Each bubble's translation must be a SINGLE "
+        "output line, no matter how long it is. NEVER split one bubble's "
+        "translation over two or more lines, and NEVER mirror the visual line "
+        "breaks that existed inside the original bubble.\n"
+        "3. Keep EXACTLY the same number of bubbles, in EXACTLY the same order as "
+        "the input. One input line becomes exactly one output line.\n"
+        "4. Lines that are just an image filename (for example `page-01.jpg`) are "
+        "page separators — they are NOT dialogue. Copy each separator EXACTLY as "
+        "it is, character for character, on its own line, without translating or "
+        "altering it.\n"
+        f"5. {spacing_rule}\n"
+        "6. PLAIN TEXT ONLY — NO MARKDOWN anywhere: never use `#` headings, "
+        "`---` horizontal rules, `**bold**`, `*italic*`, `__underline__` or "
+        "backticks in your output. Dialogue and separators are plain text.\n"
+        "7. START DIRECTLY WITH THE TRANSLATION ITSELF: the very first line of "
+        "your reply must be a page separator or a translated bubble. NEVER write "
+        "any introduction or preamble such as «Here is the translation», "
+        "«إليك الترجمة», «هذه الترجمة», «تفضل» — and never any closing remarks, "
+        "notes or offers of help. Output ONLY the translated pages and nothing "
+        "else, so the result reads like a human-made release.\n\n"
         + _literary_style_block(lang) + "\n\n"
         + _register_block(lang)
     )
 
 
 def build_vision_translation_prompt(target_language, image_names, *, total_batches=1, batch_index=1,
-                                    previous_tail=None, sfx_enabled=False, strict_order_hint=False):
+                                    previous_tail=None, sfx_enabled=False, strict_order_hint=False,
+                                    bubble_spacing=True):
     """
     برومبت الترجمة من الصور نفسها — المزوّد يرى الصفحات كما يراها القارئ البشري:
     يعرف مَن يتحدث (مذكر/مؤنث)، ومَن يُخاطب، ومفرد/جمع، وسياق المشهد — فتخرج ترجمة دقيقة.
     الترتيب مضمون بثلاث طبقات:
     1) الصور مرفقة داخل الطلب بنفس ترتيب القراءة.
     2) البرومبت يرقّم كل صورة باسم صفحتها ويصرّح بما تلي ما.
-    3) المخرَج مُلزم بإعادة فاصل كل صفحة (## name) بنفس الترتيب.
+    3) المخرَج مُلزم بإعادة فاصل كل صفحة (اسم الصورة على سطر مستقل) بنفس الترتيب.
     """
     lang = TRANSLATION_TARGETS.get(target_language, TRANSLATION_TARGETS["ar"])
     n = len(image_names)
@@ -924,6 +965,12 @@ def build_vision_translation_prompt(target_language, image_names, *, total_batch
             "background non-dialogue text (bang, crash, whoosh...). Do not write them."
         )
 
+    spacing_rule = (
+        "Separate consecutive speech bubbles with exactly ONE blank line."
+        if bubble_spacing
+        else "Do NOT leave blank lines between speech bubbles — output them continuously."
+    )
+
     parts = [
         "You are a professional literary translator specialized in manhwa and manga. "
         f"You are receiving {n} image(s) attached to this single request. They are "
@@ -937,19 +984,31 @@ def build_vision_translation_prompt(target_language, image_names, *, total_batch
         "IMAGE ORDER — ABSOLUTE:\n" + "\n".join(order_lines) + "\n"
         "Read the images strictly in this order and NEVER mix content between them.",
         "OUTPUT FORMAT — MANDATORY:\n"
-        "1. Start each page's section with its separator line EXACTLY as written "
-        "below (copy it character for character — it is NOT dialogue):\n"
-        + "\n".join(f"   ## {name}" for name in image_names) + "\n"
-        "2. Under each separator, output that page's translated dialogue: one line "
-        "per speech bubble, in correct reading flow (right-to-left, top-to-bottom). "
-        "Never merge bubbles; keep one line per bubble.\n"
-        "3. The separators must appear in the SAME order as the images, each "
+        "1. Each page's section starts with its SEPARATOR LINE: the page's filename "
+        "alone on its own line. Copy each filename EXACTLY as written below, "
+        "character for character — it is NOT dialogue and must not be translated:\n"
+        + "\n".join(image_names) + "\n"
+        "2. ONE BUBBLE = ONE LINE: every speech bubble's translation is a SINGLE "
+        "line, no matter how long it is. Even if the text inside a bubble is "
+        "visually wrapped over two or three lines in the image, JOIN it and output "
+        "it as one complete line. NEVER mirror the bubble's internal line breaks, "
+        "and NEVER split one bubble's translation across multiple lines. Never "
+        "merge two different bubbles into one line.\n"
+        f"3. {spacing_rule}\n"
+        "4. The separators must appear in the SAME order as the images, each "
         "followed by its own page's translation only.\n"
-        "4. A page with no readable dialogue: output its separator followed by "
-        "nothing.\n"
-        "5. " + sfx_line + "\n"
-        "6. Output ONLY the translated sections. No commentary, no notes, no "
-        "numbering of your own.",
+        "5. A page with no readable dialogue: output its separator line followed "
+        "by nothing.\n"
+        "6. " + sfx_line + "\n"
+        "7. PLAIN TEXT ONLY — NO MARKDOWN anywhere: never use `#` headings, "
+        "`---` horizontal rules, `**bold**`, `*italic*`, `__underline__` or "
+        "backticks. The separator is the bare filename, nothing else.\n"
+        "8. START DIRECTLY WITH THE TRANSLATION ITSELF: the very first line of "
+        "your reply must be the first page's separator line. NEVER write any "
+        "introduction or preamble such as «Here is the translation», "
+        "«إليك الترجمة», «هذه الترجمة», «تفضل» — and never any closing remarks, "
+        "notes or offers of help. Output ONLY the translated pages and nothing "
+        "else, so the result reads like a human-made release.",
         _literary_style_block(lang),
         _register_block(lang),
     ]
@@ -966,9 +1025,10 @@ def build_vision_translation_prompt(target_language, image_names, *, total_batch
         )
     if strict_order_hint:
         parts.append(
-            "ORDER RE-CHECK: your previous attempt mixed up the page separators. "
+            "ORDER RE-CHECK: your previous attempt mixed up the page separator lines. "
             "The separators MUST appear exactly in the image order listed above — "
-            f"{', '.join(image_names)} — one per page, nothing before image 1's separator."
+            f"{', '.join(image_names)} — one per page, in order, and nothing before "
+            "the first page's separator."
         )
     return "\n\n".join(parts)
 
@@ -982,12 +1042,16 @@ def _strip_code_fences(text):
 
 
 # تذكير يُلحق بكل جزء في وضع السرعة (بدون تفكير) — يعوّض غياب المعالجة الأعمق
-# ليضمن الفصحى الأدبية ومنع العامية والحركات الزائدة في الوضعين على حد سواء.
+# ليضمن الفصحى الأدبية ومنع العامية والحركات والمقدمات في الوضعين على حد سواء.
 SPEED_MODE_REMINDER = (
     "QUALITY REMINDER (fast mode): This is a professional LITERARY translation. "
     "Formal literary standard language ONLY — strictly no colloquial dialects, "
     "no slang, no street speech. And strictly NO diacritics/vowel marks "
-    "(تشكيل/حركات) except absolute necessity."
+    "(تشكيل/حركات) except absolute necessity. "
+    "FORMAT: one bubble = one single line, blank line between bubbles, plain text "
+    "with no Markdown, and your reply must START directly with the first page's "
+    "separator line — never open with «Here is the translation» / «إليك الترجمة» "
+    "or any other preamble or closing remarks."
 )
 
 
@@ -1087,6 +1151,190 @@ def _sanitize_translation(text):
     return cleaned.strip()
 
 
+# ============================================================
+# تهيئة مخرجات الترجمة النهائية — ضمان حتمي لشكل الملف:
+# فقاعة = سطر واحد، سطر فارغ بين الفقاعات، بلا مقدمات ذكاء اصطناعي،
+# وبلا أي ماركدون — الفاصل اسم الصورة المجرد فقط.
+# ============================================================
+_INTRO_PREAMBLE_RE = re.compile(
+    r"^\s*(?:"
+    # عبارات عربية شائعة للمقدمة: إليك الترجمة / هذه الترجمة الأدبية للفصل: / تفضل...
+    r"(?:إليك(?:\s+هي)?|هذه\s+هي?|تفضل|فيما\s+يلي|هنا|والآن|والان)"
+    r"\s+[^\n]{0,100}?(?:الترجمة|ترجمة|النص\s*المترجم|الناتج|النص)[^\n]{0,60}$"
+    r"|تمت\s+(?:الترجمة|المعالجة)[^\n]{0,60}$"
+    r"|[\u0600-\u06FF]*(?:الترجمة(?:\s+الأدبية)?|النص\s*المترجم|الناتج\s+المترجم)\s*[:：][^\n]{0,40}$"
+    # عبارات إنجليزية شائعة: Here is the translation / Below is...
+    r"|(?:here(?:'s|\s+is|\s+are)|below\s+is|this\s+is)"
+    r"\s+[^\n]{0,100}?(?:translation|translated|the\s+text)[^\n]{0,60}$"
+    r"|(?:translation|translated\s+text)\s*[:：][^\n]{0,40}$"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
+# أسطر الفواصل الماركدونية الزائفة (--- أو *** أو ___ أو ===)
+_MARKDOWN_RULE_LINE_RE = re.compile(r"^([\-*=_=~])\1{2,}$")
+# تمييز ماركدون داخل السطر: **عريض** / *مائل* / __تسطير__ / `كود`
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+_MD_BOLD_ALT_RE = re.compile(r"__(.+?)__")
+_MD_ITALIC_RE = re.compile(r"\*(.+?)\*")
+_MD_CODE_RE = re.compile(r"`([^`]*)`")
+_MD_HEADING_RE = re.compile(r"^#{1,6}\s+")
+
+
+def _strip_inline_markdown(line_txt):
+    """يزيل أي تنسيق ماركدون من سطر حوار — النص يبقى ساديًا كما في الإصدارات المنشورة."""
+    s = (line_txt or "").strip()
+    if not s:
+        return s
+    s = _MD_HEADING_RE.sub("", s)
+    s = _MD_CODE_RE.sub(r"\1", s)
+    s = _MD_BOLD_RE.sub(r"\1", s)
+    s = _MD_BOLD_ALT_RE.sub(r"\1", s)
+    s = _MD_ITALIC_RE.sub(r"\1", s)
+    return s.strip()
+
+
+def _strip_leading_preamble(text, names=None):
+    """
+    يحذف أي مقدمة قبل أول فاصل صفحة (مثل «إليك الترجمة») —
+    الناتج يبدأ مباشرة بأول صفحة. إن لم يوجد فاصل يُعاد النص كما هو.
+    """
+    raw = (text or "").lstrip()
+    if not raw:
+        return raw
+    lines = raw.split("\n")
+    known = {str(n).strip().lower() for n in (names or []) if n and str(n).strip()}
+    for i, ln in enumerate(lines):
+        name = _separator_name_from_line(ln)
+        if name and (not known or name.lower() in known):
+            if i == 0:
+                return raw
+            return "\n".join(lines[i:]).lstrip()
+    return raw
+
+
+def _strip_intro_preamble(text):
+    """
+    يحذف أسطر المقدمة الافتتاحية («إليك الترجمة:» مثلًا) من نص لا يحتوي
+    فواصل صفحات — حذر جدًا: يحذف فقط السطور الافتتاحية المطابقة تمامًا
+    لأنماط المقدمات المعروفة ولا يلمس أي حوار بعدها.
+    """
+    lines = (text or "").lstrip().split("\n")
+    idx = 0
+    removed = 0
+    while idx < len(lines) and removed < 3:
+        s = lines[idx].strip()
+        if not s:
+            idx += 1
+            continue
+        if _INTRO_PREAMBLE_RE.match(s):
+            removed += 1
+            idx += 1
+            continue
+        break
+    if not removed:
+        return (text or "").lstrip()
+    return "\n".join(lines[idx:]).lstrip()
+
+
+def _finalize_translation_format(text, *, bubble_spacing=True, image_names=None):
+    """
+    التهيئة النهائية الحتمية لنص الترجمة قبل كتابته في الملف — تطبيق صارم لصيغة
+    «الإصدار المنشور» في كل الأحوال مهما أخطأ المزوّد:
+    1) أي مقدمة قبل أول فاصل صفحة تُحذف (إليك الترجمة... إلخ).
+    2) كل فاصل صفحة يطبع اسم الصورة المجرد فقط، بسطر فارغ قبله وبعده.
+    3) كل فقاعة سطر واحد كامل: الفقاعات المفصولة بسطر فارغ تُدمج أسطرها الداخلية
+       في سطر واحد؛ ولا يُدمج أبدًا ما بينهما.
+    4) سطر فارغ واحد بين الفقاعات (أو نص متصل عندما يعطّل المستخدم المسافات).
+    5) لا ماركدون إطلاقًا: لا # ولا --- ولا ** ولا ` — تُنظف من كل سطر.
+    """
+    raw = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = raw.split("\n")
+    known = {str(n).strip().lower() for n in (image_names or []) if n and str(n).strip()}
+
+    def sep_name(ln):
+        name = _separator_name_from_line(ln)
+        if not name:
+            return None
+        # سطر يشبه اسم ملف لكنه ليس من صفحات هذا الفصل — يبقى حوارًا عاديًا
+        if known and name.lower() not in known:
+            return None
+        return name
+
+    # تقسيم النص إلى أقسام صفحات: (اسم الفاصل أو None، أسطر الحوار)
+    sections = []
+    current_name = None
+    current_lines = []
+    for ln in lines:
+        name = sep_name(ln.strip())
+        if name:
+            sections.append((current_name, current_lines))
+            current_name = name
+            current_lines = []
+            continue
+        current_lines.append(ln)
+    sections.append((current_name, current_lines))
+
+    has_named = any(name for name, _ in sections)
+    # أي محتوى قبل أول فاصل صفحة هو مقدمة ماركدونية/ذكاء اصطناعي — تُحذف
+    if has_named and sections and sections[0][0] is None:
+        sections = sections[1:]
+
+    joiner = "\n\n" if bubble_spacing else "\n"
+    out_parts = []
+    for name, dial_lines in sections:
+        # تنظيف الأسطر مع الحفاظ على الأسطر الفارغة كعلامات فصل بين الفقاعات —
+        # هي وحدها ما يحدد حدود الفقاعة فلا يُدمج شيء مُخلّ.
+        cleaned = []
+        for ln in dial_lines:
+            s = ln.strip()
+            if _MARKDOWN_RULE_LINE_RE.match(s):
+                continue  # أسطر الفواصل الماركدونية تُحذف كليًا
+            if not s:
+                if cleaned and cleaned[-1] != "":
+                    cleaned.append("")
+                continue
+            m = _strip_inline_markdown(s)
+            if m:
+                cleaned.append(m)
+        while cleaned and cleaned[0] == "":
+            cleaned.pop(0)
+        while cleaned and cleaned[-1] == "":
+            cleaned.pop()
+        if not cleaned and name is None:
+            continue
+        if not cleaned:
+            body = ""
+        elif bubble_spacing:
+            # الفقاعات مفصولة بأسطر فارغة = كتل؛ كل كتلة تُدمج في سطر واحد كامل
+            blocks, cur = [], []
+            for s in cleaned:
+                if s == "":
+                    if cur:
+                        blocks.append(cur)
+                        cur = []
+                else:
+                    cur.append(s)
+            if cur:
+                blocks.append(cur)
+            if len(blocks) >= 2:
+                body = joiner.join(" ".join(b) for b in blocks)
+            else:
+                # لا توجد أسطر فارغة أصلاً — كل سطر فقاعة مستقلة (لا دمج مُخِلّ)
+                body = joiner.join(s for s in cleaned if s)
+        else:
+            body = joiner.join(s for s in cleaned if s)
+        if name is None:
+            out_parts.append(body)
+        elif not body:
+            out_parts.append(name)
+        else:
+            out_parts.append(f"{name}\n{body}" if not bubble_spacing else f"{name}\n\n{body}")
+
+    final = "\n\n".join(p for p in out_parts if p and p.strip())
+    return final.strip()
+
+
 # أنماط كشف التشكيل وحروف العربية — تخدم شبكة أمان الحركات
 _TASHKEEL_RE = re.compile(r"[\u064B-\u0655\u0670]")
 _ARABIC_LETTER_RE = re.compile(r"[\u0621-\u064A]")
@@ -1109,7 +1357,7 @@ def _strip_excessive_tashkeel(text):
 def _split_translation_chunks(chapter_text, max_lines=None, max_chars=None):
     """
     يقسم نص الفصل إلى مجموعات ترجمة متوازنة:
-    - حدود المجموعات عند فواصل الصفحات (## name) كلما أمكن فلا ينقطع سياق صفحة.
+    - حدود المجموعات عند فواصل الصفحات (اسم الصورة على سطر مستقل) كلما أمكن فلا ينقطع سياق صفحة.
     - كل مجموعة تحت سقف أسطر/أحرف حتى لا ينقطع الناتج عند المزوّد.
     """
     max_lines = max_lines or TRANSLATION_CHUNK_LINES
@@ -1123,7 +1371,7 @@ def _split_translation_chunks(chapter_text, max_lines=None, max_chars=None):
     blocks = []
     current = []
     for ln in lines:
-        if ln.strip().startswith("## ") and current:
+        if _separator_name_from_line(ln) and current:
             blocks.append(current)
             current = [ln]
         else:
@@ -1175,11 +1423,18 @@ def translate_chapter_text(user_id, chapter_text, settings, *, thinking_enabled=
     الفصول الطويلة تُقسم تلقائيًا إلى مجموعات مترجمة بالتتابع
     (مع تقدم حي عبر progress_cb) حتى لا ينقطع الناتج،
     ووضع الدقة الكاملة يفعّل المعالجة الأعمق لكل مجموعة.
-    الناتج النهائي يخضع لمراجعتين آليتين:
-    1) مراجعة المقاطع الأجنبية المتبقية — تُترجم وتُلصق مكانها (حروف التصنيف محمية).
-    2) شبكة أمان الحركات — التشكيل المفرط يُزال إلا الضرورة النادرة.
+    الناتج النهائي يخضع لثلاث مراجعات آلية:
+    1) حذف أي مقدمة قبل الترجمة (مثل «إليك الترجمة») — الناتج صفحات فقط.
+    2) مراجعة المقاطع الأجنبية المتبقية — تُترجم وتُلصق مكانها (حروف التصنيف محمية).
+    3) شبكة أمان الحركات + التهيئة النهائية: فقاعة = سطر واحد، سطر فارغ بين
+       الفقاعات، وبلا أي ماركدون — الفاصل اسم الصورة المجرد.
     """
     target = (settings or {}).get("translate_target", "ar")
+    bubble_spacing = bool((settings or {}).get("bubble_spacing", True))
+    known_names = [
+        name for name in (_separator_name_from_line(ln) for ln in (chapter_text or "").splitlines())
+        if name
+    ]
     chunks = _split_translation_chunks(chapter_text)
     if not chunks:
         raise Exception("لا يوجد نص لترجمته.")
@@ -1197,7 +1452,7 @@ def translate_chapter_text(user_id, chapter_text, settings, *, thinking_enabled=
             if total > 1 else ""
         )
         prompt = (
-            build_translation_prompt(target)
+            build_translation_prompt(target, bubble_spacing=bubble_spacing)
             + ("\n\n" + SPEED_MODE_REMINDER if not thinking_enabled else "")
             + part_note
             + "\n\n=== CHAPTER TEXT START ===\n"
@@ -1208,6 +1463,11 @@ def translate_chapter_text(user_id, chapter_text, settings, *, thinking_enabled=
             user_id, prompt, service_type="chat", thinking_enabled=thinking_enabled,
         )
         cleaned = _sanitize_translation(part)
+        # أي مقدمة قبل أول فاصل صفحة تُحذف هنا قبل أي شيء آخر —
+        # حتى لا تدخل في المراجعة الآلية ولا في الناتج أبدًا.
+        cleaned = _strip_leading_preamble(cleaned, known_names)
+        if i == 1:
+            cleaned = _strip_intro_preamble(cleaned)
         if not cleaned:
             raise Exception(f"جاءت ترجمة الجزء {i} فارغة — حاول مرة أخرى.")
         outputs.append(cleaned)
@@ -1218,7 +1478,10 @@ def translate_chapter_text(user_id, chapter_text, settings, *, thinking_enabled=
     final_text = _review_foreign_text(user_id, final_text, target_code=target)
     if target == "ar":
         final_text = _strip_excessive_tashkeel(final_text)
-    return final_text
+    # التهيئة النهائية الحتمية — الشكل مضمون مهما أخطأ المزوّد
+    return _finalize_translation_format(
+        final_text, bubble_spacing=bubble_spacing, image_names=known_names,
+    )
 
 
 # ============================================================
@@ -1226,14 +1489,14 @@ def translate_chapter_text(user_id, chapter_text, settings, *, thinking_enabled=
 # ============================================================
 def _ordered_header_matches(text, names):
     """
-    كم فاصل صفحة (## name) ظهر بالنص وبنفس ترتيب الصور؟
+    كم فاصل صفحة (اسم الصورة على سطر مستقل) ظهر بالنص وبنفس ترتيب الصور؟
     يُستخدم للتحقق من أن الترجمة حافظت على ترتيب الصور المرفقة حرفيًا.
     """
     matched = 0
     remaining = list(names)
     for ln in (text or "").splitlines():
-        s = ln.strip()
-        if s.startswith("## ") and remaining and s[3:].strip() == remaining[0]:
+        name = _separator_name_from_line(ln)
+        if name and remaining and name.lower() == str(remaining[0]).strip().lower():
             remaining.pop(0)
             matched += 1
     return matched
@@ -1244,7 +1507,7 @@ def _context_tail(text, limit=6):
     lines = []
     for ln in (text or "").splitlines():
         s = ln.strip()
-        if not s or s.startswith("## ") or set(s) <= set("-—=*_~ "):
+        if not s or _separator_name_from_line(s) or set(s) <= set("-—=*_~ "):
             continue
         lines.append(s)
     return lines[-limit:] or None
@@ -1260,14 +1523,18 @@ def vision_translate_chapter(user_id, images, settings, *, thinking_enabled=Fals
       الواجهة تقبل 5 صور) بنفس ترتيب القراءة.
     - ترتيب كل دفعة مضمون بثلاث طبقات: ترتيب الإرفاق داخل الطلب + ترقيم صريح
       في البرومبت (صورة 1 = صفحة كذا وتليها صورة 2 مباشرة...) + إلزام إعادة
-      فاصل كل صفحة (## name) بنفس الترتيب — وإن اختل الترتيب تُعاد المحاولة بتلميح أصرم.
+      فاصل كل صفحة (اسم الصورة على سطر مستقل) بنفس الترتيب — وإن اختل الترتيب
+      تُعاد المحاولة بتلميح أصرم.
     - الدفعات تُعالج بالتتابع وكل دفعة تصل نهاية الدفعة السابقة سياقًا لاستمرار السرد.
     - الفصحى الأدبية ومنع العامية والحركات والمراجعة الآلية مطبقة كما في المسار النصي
       وفي الوضعين (السرعة والدقة).
+    - الناتج النهائي يمر بالتهيئة الحتمية: بلا مقدمات، فقاعة = سطر واحد،
+      سطر فارغ بين الفقاعات، وبلا أي ماركدون.
     - عند فشل دفعة بعد المحاولات: خطة بديلة — ترجمة نصية من نص استخراج صفحاتها
       إن توفر (extracted_texts)، وإلا فشلت الترجمة صراحة.
     """
     target = (settings or {}).get("translate_target", "ar")
+    bubble_spacing = bool((settings or {}).get("bubble_spacing", True))
     if not images:
         raise Exception("لا توجد صور لترجمتها.")
     batches = [
@@ -1297,6 +1564,7 @@ def vision_translate_chapter(user_id, images, settings, *, thinking_enabled=Fals
                     previous_tail=previous_tail,
                     sfx_enabled=bool((settings or {}).get("include_sfx", False)),
                     strict_order_hint=(attempt > 1),
+                    bubble_spacing=bubble_spacing,
                 )
                 if not thinking_enabled:
                     prompt += "\n\n" + SPEED_MODE_REMINDER
@@ -1307,6 +1575,9 @@ def vision_translate_chapter(user_id, images, settings, *, thinking_enabled=Fals
                 if _is_no_text_response(raw):
                     raise Exception("رد غير صالح من محرك المعالجة — سيُعاد المحاولة.")
                 cleaned = _sanitize_translation(raw)
+                # أي مقدمة قبل أول فاصل صفحة («إليك الترجمة»...) تُحذف هنا —
+                # الناتج يبدأ بأول صفحة مباشرة، والتحقق من الترتيب على النص النظيف.
+                cleaned = _strip_leading_preamble(cleaned, names)
                 if not cleaned:
                     raise Exception("جاءت ترجمة الدفعة فارغة — حاول مرة أخرى.")
                 matches = _ordered_header_matches(cleaned, names)
@@ -1337,7 +1608,8 @@ def vision_translate_chapter(user_id, images, settings, *, thinking_enabled=Fals
                 continue
             outputs.append(
                 translate_chapter_text(
-                    user_id, "".join(fallback_parts).strip(), {"translate_target": target},
+                    user_id, "".join(fallback_parts).strip(),
+                    {"translate_target": target, "bubble_spacing": bubble_spacing},
                     thinking_enabled=thinking_enabled,
                 )
             )
@@ -1354,7 +1626,13 @@ def vision_translate_chapter(user_id, images, settings, *, thinking_enabled=Fals
     final_text = _review_foreign_text(user_id, final_text, target_code=target)
     if target == "ar":
         final_text = _strip_excessive_tashkeel(final_text)
-    return final_text
+    # التهيئة النهائية الحتمية — بلا مقدمات، فقاعة = سطر واحد، سطر فارغ بين
+    # الفقاعات، وبلا أي ماركدون — مهما أخطأ المزوّد
+    return _finalize_translation_format(
+        final_text,
+        bubble_spacing=bubble_spacing,
+        image_names=[name for _, name in images],
+    )
 
 
 # ============================================================
@@ -2457,15 +2735,15 @@ def _is_rank_letters(phrase):
 
 def _collect_foreign_segments(text, target_code="ar"):
     """
-    يجمع المقاطع الأجنبية الفريدة (إنجليزية/كورية/صينية/يابانية) من نص مستخرج.
+    يجمع المقاطع الأجنبية الفريدة (إنجليزية/كورية/صينية/يابانية) من نص مترجم.
     - حروف التصنيف المفردة/المزدوجة بأحرف كبيرة (A, S, SS, C...) تبقى كما هي.
-    - فاصل الصفحات (## name) لا يُمس أبدًا.
+    - فاصل الصفحات (اسم الصورة على سطر مستقل) لا يُمس أبدًا.
     يعيد قائمة {"text", "line"} بلا تكرار.
     """
     segments = []
     seen = set()
     for line_txt in (text or "").splitlines():
-        if not line_txt.strip() or line_txt.strip().startswith("## "):
+        if not line_txt.strip() or _separator_name_from_line(line_txt):
             continue
         found = []
         if target_code == "ar":
@@ -2564,9 +2842,9 @@ def _review_foreign_text(user_id, text, *, target_code="ar"):
                     translations[str(item["id"]).strip()] = item["ar"].strip()
         if not translations:
             return text
-        result = text
         # الأطول أولًا حتى لا يفسد مقطع قصير جزءًا من مقطع أطول
         indexed = sorted(enumerate(segments), key=lambda kv: len(kv[1]["text"]), reverse=True)
+        replacements = []
         for i, seg in indexed:
             translated = translations.get(str(i + 1), "")
             original = seg["text"]
@@ -2574,8 +2852,20 @@ def _review_foreign_text(user_id, text, *, target_code="ar"):
                 continue
             if len(translated) > max(40, len(original) * 4 + 20):
                 continue  # حماية من هلوسة تضخّم النص
-            result = result.replace(original, translated)
-        return result
+            replacements.append((original, translated))
+        if not replacements:
+            return text
+        # الاستبدال سطرًا بسطر — أسطر فواصل الصفحات (أسماء الصور) لا تُمس أبدًا
+        out_lines = []
+        for line_txt in text.split("\n"):
+            if _separator_name_from_line(line_txt):
+                out_lines.append(line_txt)
+                continue
+            for original, translated in replacements:
+                if original in line_txt:
+                    line_txt = line_txt.replace(original, translated)
+            out_lines.append(line_txt)
+        return "\n".join(out_lines)
     except Exception:
         return text  # أي خلل لا يفسد النص الأصلي أبدًا
 
@@ -2818,6 +3108,12 @@ def process_drive_link(link, *, include_name=False):
                 or name.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp"))
             ):
                 continue
+            # توحيد الاسم: صور Drive بلا امتداد تحصل على امتداد من نوعها،
+            # حتى يبقى سطر فاصل الصفحة في الملف دائمًا باسم ملف واضح.
+            if not name.lower().endswith(_SEPARATOR_IMAGE_EXTS):
+                ext_map = {"jpeg": ".jpg", "jpg": ".jpg", "png": ".png", "webp": ".webp", "bmp": ".bmp", "gif": ".gif"}
+                mime_ext = str(mime).split("image/")[-1].split(";")[0].strip().lower()
+                name = f"{name}{ext_map.get(mime_ext, '.jpg')}"
             data = ensure_valid_image(download_drive_image(f["id"]), name)
             images.append((data, name))
         if not images:
@@ -3836,7 +4132,8 @@ def help_sections():
             "وإذا تعذّرت قراءة صفحة سيحاول البوت **إعادة المحاولة تلقائيًا** قبل الاستسلام، "
             "وملف الاستخراج يخرج دائمًا **باللغة الأصلية** كما في الصور تمامًا (لا ترجمة فيه إطلاقًا).\n"
             "> {emoji:num_4} تصلك لوحة النتيجة: الملف داخلها مباشرة + **تقرير جودة** (الصور الفارغة، المدة، الصيغة).\n"
-            "> **ملاحظات:** النص يُرتّب حسب أسماء الصور (مرّتها = مرتب الناتج)، ويُفصل كل صفحة بسطر `## اسم الصورة`.\n"
+            "> **ملاحظات:** النص يُرتّب حسب أسماء الصور (مرّتها = مرتب الناتج)، ويُفصل كل صفحة بسطر يحتوي **اسم الصورة فقط** "
+            "دون أي رموز أو تنسيق.\n"
             "> **عند تفعيل الترجمة** من الإعدادات تصلك لوحة بملفين: **النص المستخرج (اللغة الأصلية)** + **الترجمة الأدبية** — "
             "والترجمة تتم الآن **من الصور نفسها** بسياقها البصري الكامل (مذكر/مؤنث، المخاطَب، مفرد/جمع)."
         ),
@@ -3863,7 +4160,9 @@ def help_sections():
             "> **الواجهة تقبل `5` صور في الطلب الواحد** — فالفصل الطويل يُترجم على **دفعات من 5 صفحات مرتبة**، "
             "وكل دفعة تصلها نهاية الدفعة السابقة سياقًا لاستمرار السرد.\n"
             "> وتخضع الترجمة لكل الضمانات: **فصحى أدبية** بلا عامية، **بلا حركات** إلا للضرورة القصوى، "
-            "و**مراجعة آلية** تترجم أي مقطع أجنبي متبقٍ (حروف التصنيف `A` `S` `SS` `C` تبقى كما هي)."
+            "و**مراجعة آلية** تترجم أي مقطع أجنبي متبقٍ (حروف التصنيف `A` `S` `SS` `C` تبقى كما هي).\n"
+            "> **صيغة الملف مثل الإصدارات المنشورة:** كل فقاعة على **سطر واحد كامل** وسطر فارغ بين الفقاعات، "
+            "وفاصل الصفحات **اسم الصورة فقط** بدون أي رموز — وبلا أي مقدمة مثل «إليك الترجمة» ولا أي ماركدون."
         ),
         "## {emoji:message} الأمر `/translate` — ترجمة فصل",
         (
@@ -3872,7 +4171,8 @@ def help_sections():
             "أو ترسل نصًا جاهزًا فيُترجم نصيًا. دائمًا **فصحى أدبية** بلا عامية ولا لهجات و**بدون حركات/تشكيل** "
             "إلا للضرورة القصوى — في الوضعين (السرعة والدقة) على حد سواء.\n"
             "> ويخضع الناتج ل**مراجعة آلية** تترجم أي مقطع أجنبي متبقٍ وتلصقه مكانه "
-            "(مع إبقاء حروف التصنيف مثل `A` `S` `SS` `C` كما هي).\n"
+            "(مع إبقاء حروف التصنيف مثل `A` `S` `SS` `C` كما هي)، ويخرج دائمًا **بلا أي مقدمة** مثل «إليك الترجمة» "
+            "— كل فقاعة على سطر واحد وسطر فارغ بين الفقاعات وفاصل باسم الصورة فقط بدون ماركدون.\n"
             "> **كيف يعمل؟ نفس تفاعل `/extract` تمامًا:**\n"
             "> {emoji:num_1} نفّذ `/translate` واختر وضع المعالجة: **سرعة عالية** (بدون تفكير — أسرع) أو **دقة كاملة** (مع تفكير — أعمق وأبطأ).\n"
             "> {emoji:num_2} أرسل المصدر بإحدى ثلاث طرق:\n"
@@ -4068,6 +4368,7 @@ async def translate(interaction: discord.Interaction,
         profile["settings"].get("output_format", "txt"),
         thinking_enabled=thinking_enabled,
         images=images,
+        bubble_spacing=profile["settings"].get("bubble_spacing", True),
     )
 
 
@@ -4359,6 +4660,7 @@ async def prefix_translate(ctx):
         profile["settings"].get("output_format", "txt"),
         thinking_enabled=thinking_enabled,
         images=images,
+        bubble_spacing=profile["settings"].get("bubble_spacing", True),
     )
 
 
